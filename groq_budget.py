@@ -463,6 +463,19 @@ class GroqBudgetGovernor:
         usage.used += 1
         self._save_state()
 
+    def try_admit_feature(self, feature: str) -> bool:
+        """Count one use of ``feature`` against its daily cap without a model call.
+
+        For features that do not call the model (e.g. templated engagement
+        nudges) but must still respect a per-feature daily cap.
+        """
+        key = (feature or "general").strip().lower() or "general"
+        try:
+            self._admit_feature(key)
+        except FeatureCapExceededError:
+            return False
+        return True
+
     def _refund_feature(self, feature: str) -> None:
         usage = self._features.get(feature)
         if usage is not None and usage.day == self._day_key() and usage.used > 0:
