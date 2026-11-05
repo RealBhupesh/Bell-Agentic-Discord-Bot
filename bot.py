@@ -339,7 +339,8 @@ CAPABILITIES_CATALOG_KEY = "capabilities_catalog"
 BAD_WORDS_FILE = DATA_DIR / "bad_words.txt"
 ENGAGEMENT_STATE_KEY = "engagement"
 BUSINESS_STATE_KEY = "economy"
-# Legacy data from the removed history-mining aicrush feature; deleted at startup.
+# Legacy data from the removed history-mining aicrush feature. Nothing reads or
+# writes it any more; it is only deleted if the bot owner runs `&legacydata wipe confirm`.
 LEGACY_AICRUSH_STATE_KEY = "legacy_aicrush"
 CRUSH_GAME_STATE_KEY = "crush_game"
 ALTFINDER_STATE_KEY = "altfinder"
@@ -21353,10 +21354,7 @@ CRUSH_GAME = crush_game.CrushGame(
 
 def load_crush_game_state() -> None:
     global CRUSH_GAME_STATE
-    # The legacy data only ever existed as files under data/, whatever backend is active.
-    removed = storage.JsonFileBackend(DATA_DIR).delete_files(LEGACY_AICRUSH_STATE_KEY)
-    if removed:
-        print(f"[CRUSH GAME] Deleted legacy aicrush history data: {', '.join(removed)}")
+    # The legacy aicrush file is deliberately neither read nor deleted here.
     CRUSH_GAME_STATE = crush_game.CrushGameState(read_state(CRUSH_GAME_STATE_KEY))
     CRUSH_GAME.state = CRUSH_GAME_STATE
 
@@ -21418,6 +21416,40 @@ async def crush_game_admin_command(
     else:
         state = "on" if CRUSH_GAME.is_enabled(ctx.guild.id) else "off"
         await ctx.send(f"Crush-o-Meter game is **{state}**. Use `{PREFIX}crushgame on [#channel]` or `off`.")
+
+
+def _legacy_aicrush_paths() -> list[Path]:
+    # The legacy data only ever existed as files under data/, whatever backend is active.
+    legacy_files = storage.JsonFileBackend(DATA_DIR)
+    path = legacy_files.path_for(LEGACY_AICRUSH_STATE_KEY)
+    return [path, legacy_files.backup_path(path)]
+
+
+@bot.command(name="legacydata")
+@commands.is_owner()
+async def legacy_data_command(ctx: commands.Context, action: str = "status", confirm: str = "") -> None:
+    """Owner-only: inspect or delete the old aicrush data file (never read by the bot)."""
+    paths = _legacy_aicrush_paths()
+    action = (action or "status").strip().lower()
+    if action == "wipe":
+        if confirm.strip().lower() != "confirm":
+            await ctx.send(
+                f"This permanently deletes the old aicrush data file(s). Run `{PREFIX}legacydata wipe confirm` to proceed."
+            )
+            return
+        removed = crush_game.delete_legacy_files(paths)
+        await ctx.send(
+            f"Deleted {len(removed)} legacy aicrush file(s)." if removed else "No legacy aicrush files found."
+        )
+        return
+    present = crush_game.legacy_files_present(paths)
+    if present:
+        await ctx.send(
+            f"{len(present)} legacy aicrush file(s) are still on disk. The bot does not read them. "
+            f"Delete with `{PREFIX}legacydata wipe confirm`."
+        )
+    else:
+        await ctx.send("No legacy aicrush files are on disk.")
 
 
 @bot.command(name="exclude")

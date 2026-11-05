@@ -69,7 +69,7 @@ def test_governor_counters_round_trip(data_dir):
     assert exported["models"]["openai/gpt-oss-120b"]["rpd"]["tokens"] == pytest.approx(990.0)
 
 
-def test_legacy_aicrush_files_are_deleted_through_adapter(data_dir):
+def test_legacy_aicrush_area_maps_to_primary_and_backup_files(data_dir):
     backend = storage.JsonFileBackend(data_dir)
     (data_dir / "aicrush_state.json.bak").write_text("{}", encoding="utf-8")
     removed = backend.delete_files("legacy_aicrush")

@@ -93,7 +93,7 @@ def render_report(reports: Sequence[AreaReport], legacy: Sequence[Path], *, dry_
     for r in reports:
         out.write(f"{r.key:<24} {r.table:<30} {r.status:<12} {r.rows:>6} {r.size:>9}  {r.path}\n")
     for path in legacy:
-        out.write(f"skip (legacy, never migrated; the bot deletes it at startup): {path}\n")
+        out.write(f"skip (legacy, never migrated; delete with &legacydata wipe confirm): {path}\n")
     docs = [r for r in reports if r.migratable]
     rows = sum(r.rows for r in docs)
     missing = sum(1 for r in reports if r.status == "missing")

@@ -132,7 +132,7 @@ AREAS: tuple[StateArea, ...] = (
         "legacy_aicrush",
         "aicrush_state.json",
         "",
-        "Removed history-mining aicrush data; deleted at startup, never migrated.",
+        "Removed history-mining aicrush data; never read or migrated, deleted only by `&legacydata wipe confirm`.",
         legacy=True,
     ),
 )

@@ -80,7 +80,7 @@ def test_dry_run_reports_every_area(data_dir):
         assert Path(source) == data_dir / area.filename
     total_rows = sum(_expected_rows(a.filename) for a in storage.MIGRATABLE_AREAS)
     assert f"Summary: would migrate {len(storage.MIGRATABLE_AREAS)} documents ({total_rows} rows); 0 missing, 0 unreadable." in output
-    assert f"skip (legacy, never migrated; the bot deletes it at startup): {data_dir / 'aicrush_state.json'}" in output
+    assert f"skip (legacy, never migrated; delete with &legacydata wipe confirm): {data_dir / 'aicrush_state.json'}" in output
     assert "asyncpg" not in sys.modules
     assert _digest(data_dir) == before  # nothing on disk changed
 

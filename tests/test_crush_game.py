@@ -338,12 +338,37 @@ def test_old_history_mining_path_is_removed():
         assert gone not in source, gone
 
 
-def test_legacy_aicrush_file_is_purged(tmp_path):
+def test_legacy_aicrush_file_is_not_read_or_deleted_at_startup():
+    source = bot_source()
+    loader = source.split("def load_crush_game_state()", 1)[1].split("\ndef ", 1)[0]
+    assert "LEGACY_AICRUSH" not in loader and "delete_legacy" not in loader
+    # The legacy reader is gone: nothing opens, creates or deletes the file automatically.
+    assert source.count("LEGACY_AICRUSH_STATE_KEY") == 2  # definition + one use in the owner-only path helper
+    assert "read_state(LEGACY_AICRUSH_STATE_KEY" not in source
+    assert "AICRUSH_STATE_FILE.write_text" not in source
+    assert not hasattr(cg, "purge_legacy_files")
+
+
+def test_legacy_file_is_deleted_only_by_owner_command_with_confirm():
+    source = bot_source()
+    assert source.count("crush_game.delete_legacy_files(") == 1
+    command = source.split('@bot.command(name="legacydata")', 1)[1].split("\n@bot.", 1)[0]
+    assert "@commands.is_owner()" in command
+    assert 'confirm.strip().lower() != "confirm"' in command
+    assert "crush_game.delete_legacy_files(paths)" in command
+
+
+def test_legacy_helpers_never_read_contents(tmp_path):
     legacy = tmp_path / "aicrush_state.json"
-    legacy.write_text('{"guilds": {"1": {"users": {"5": {"samples": ["made-up old text"]}}}}}', encoding="utf-8")
+    legacy.write_text('{"made": "up"}', encoding="utf-8")
     missing = tmp_path / "aicrush_state.json.bak"
-    assert cg.purge_legacy_files([legacy, missing]) == [str(legacy)]
+    assert cg.legacy_files_present([legacy, missing]) == [str(legacy)]
+    assert legacy.exists()  # checking presence leaves it untouched
+    assert cg.delete_legacy_files([legacy, missing]) == [str(legacy)]
     assert not legacy.exists()
+    src = (ROOT / "crush_game.py").read_text(encoding="utf-8")
+    helpers = src[src.index("def legacy_files_present"):]
+    assert "read_text" not in helpers and "open(" not in helpers
 
 
 # -- framing ----------------------------------------------------------------------------
@@ -364,6 +389,26 @@ def test_disclaimer_present_in_every_result():
                 assert s.play(invoker, partner, answer).rstrip().endswith(cg.DISCLAIMER)
     lowered = cg.DISCLAIMER.lower()
     assert "joke" in lowered and "not anyone's real" in lowered and "orientation" in lowered
+
+
+def test_disclaimer_and_notice_describe_analysis_accurately():
+    """The player's own deliberate input IS analyzed; history and other members' messages never are."""
+    s = Setup()
+    s.enable()
+    notice = s.channel.sent[0]
+    result = s.play(s.alice, s.bob, answer="MY OWN WORDS!!")  # the player's input is analyzed
+    for text in (cg.DISCLAIMER, notice, result):
+        lowered = text.lower()
+        assert "nobody's messages were analyzed" not in lowered
+        assert "no messages were analyzed" not in lowered
+    for text in (cg.DISCLAIMER, notice):
+        lowered = " ".join(text.lower().split())
+        assert "message history" in lowered
+        assert "other member's messages" in lowered
+        assert "deliberately" in lowered
+    assert "never analyzes message history or any other member's messages" in " ".join(notice.split())
+    assert "No message history and no other member's messages are ever analyzed" in cg.DISCLAIMER
+    assert "only what the player deliberately gave the game" in cg.DISCLAIMER
 
 
 def test_romantic_or_orientation_flavor_is_dropped():
