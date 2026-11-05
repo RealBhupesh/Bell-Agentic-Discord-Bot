@@ -124,7 +124,7 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `OPENROUTER_HTTP_REFERER=`
 - `AI_PROVIDER=openrouter`
 - `GROQ_API_KEY=`
-- `GROQ_MODEL=llama-3.1-8b-instant`
+- `GROQ_MODEL=openai/gpt-oss-120b`
 - `GROQ_API_URL=https://api.groq.com/openai/v1/chat/completions`
 - `GROQ_MODELS_URL=https://api.groq.com/openai/v1/models`
 - `AI_MAX_HISTORY=4`
@@ -209,11 +209,36 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `ROAST_HISTORY_PER_CHANNEL=280`
 - `ROAST_CACHE_MAX_MESSAGES=1400`
 - `OPENROUTER_FALLBACK_MODELS=google/gemma-3-4b-it:free,qwen/qwen3-4b:free,deepseek/deepseek-r1-0528:free`
-- `GROQ_FALLBACK_MODELS=llama-3.1-8b-instant,gemma2-9b-it`
+- `GROQ_FALLBACK_MODELS=openai/gpt-oss-20b,qwen/qwen3.8-27b`
+- `GROQ_LIMIT_RPM=30`
+- `GROQ_LIMIT_RPD=1000`
+- `GROQ_LIMIT_TPM=8000`
+- `GROQ_LIMIT_TPD=200000`
+- `GROQ_MODEL_LIMITS=`
+- `GROQ_FEATURE_DAILY_CAPS=`
+- `GROQ_FEATURE_DAILY_CAP_DEFAULT=0`
+- `GROQ_BUDGET_MAX_WAIT_SECONDS=20`
+- `GROQ_DEFAULT_RETRY_AFTER_SECONDS=60`
+- `GROQ_QUEUE_MAX=100`
 - `FFMPEG_PATH=ffmpeg`
 - `MUSIC_MAX_PLAYLIST_ITEMS=50`
 - `SPOTIFY_CLIENT_ID=`
 - `SPOTIFY_CLIENT_SECRET=`
+
+## Groq Budget Governor
+
+Every Groq chat completion goes through `groq_budget.py`, which keeps the bot inside Groq's free tier
+(defaults: 30 requests/min, 1,000 requests/day, 8K tokens/min, 200K tokens/day per model):
+
+- Per-model token buckets for RPM/RPD/TPM/TPD (`GROQ_LIMIT_*`; per-model overrides via
+  `GROQ_MODEL_LIMITS=model=rpm:rpd:tpm:tpd;other=...`).
+- FIFO request queue: a short wait for minute budgets (up to `GROQ_BUDGET_MAX_WAIT_SECONDS`) is spent in line.
+- Optional per-feature daily caps: `GROQ_FEATURE_DAILY_CAPS=ai_chat=300,aicrush_explain=50`
+  (feature names are the AI `policy_key`s; `GROQ_FEATURE_DAILY_CAP_DEFAULT=0` means unlimited).
+- Automatic fallback to the next model on HTTP 429 or an exhausted budget.
+- When every model is out of budget, AI commands reply "AI budget used up for today" without calling Groq.
+
+Run the tests with `pip install -r requirements-dev.txt && python -m pytest`.
 
 ## Required Bot Permissions
 

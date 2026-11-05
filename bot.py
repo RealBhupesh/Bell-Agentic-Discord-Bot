@@ -23,6 +23,8 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+import groq_budget
+
 try:
     import yt_dlp
 except Exception:
@@ -93,7 +95,7 @@ OPENROUTER_MODELS_URL = os.getenv("OPENROUTER_MODELS_URL", "https://openrouter.a
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Discord Mod Bot").strip()
 OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
+GROQ_MODEL, GROQ_FALLBACK_MODELS = groq_budget.load_groq_model_config(os.environ)
 GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
 GROQ_MODELS_URL = os.getenv("GROQ_MODELS_URL", "https://api.groq.com/openai/v1/models").strip()
 AI_MAX_HISTORY = env_int("AI_MAX_HISTORY", 4, 2)
@@ -143,14 +145,6 @@ OPENROUTER_FALLBACK_MODELS = [
     for model in os.getenv(
         "OPENROUTER_FALLBACK_MODELS",
         "google/gemma-3-4b-it:free,qwen/qwen3-4b:free,deepseek/deepseek-r1-0528:free",
-    ).split(",")
-    if model.strip()
-]
-GROQ_FALLBACK_MODELS = [
-    model.strip()
-    for model in os.getenv(
-        "GROQ_FALLBACK_MODELS",
-        "llama-3.1-8b-instant,gemma2-9b-it",
     ).split(",")
     if model.strip()
 ]
@@ -461,6 +455,7 @@ MODEL_CACHE_TS = 0.0
 MODEL_CACHE_TTL_SECONDS = 600
 AI_REQUEST_SEMAPHORE = asyncio.Semaphore(AI_MAX_INFLIGHT)
 AI_CIRCUIT_OPEN_UNTIL: dict[str, float] = {}
+GROQ_BUDGET = groq_budget.GroqBudgetGovernor.from_env(os.environ)
 AI_MOD_STATE: dict[str, Any] = {}
 AI_MOD_STATE_DIRTY = False
 AI_MOD_STATE_LOCK = asyncio.Lock()
@@ -6226,6 +6221,7 @@ async def rerank_aicrush_candidates_with_ai(
                 fallback_models=AICRUSH_FALLBACK_MODELS,
                 response_format=_aicrush_rank_schema(),
                 include_fallback_notice=False,
+                feature=f"aicrush_ranker_{direction}",
             )
             payload = _extract_first_json_object(raw)
         except Exception:
@@ -6412,6 +6408,7 @@ async def build_aicrush_pair_explanation(
                 temperature=0.45,
                 model_override=AICRUSH_EXPLAIN_MODEL or None,
                 fallback_models=AICRUSH_FALLBACK_MODELS,
+                feature="aicrush_explain",
             )
         return await request_ai_completion(
             messages,
@@ -7461,6 +7458,7 @@ async def rerank_altfinder_candidates_with_ai(
                 fallback_models=ALTFINDER_FALLBACK_MODELS,
                 response_format=_altfinder_rank_schema(),
                 include_fallback_notice=False,
+                feature="altfinder_rank",
             )
         else:
             raw = await request_ai_completion(
@@ -7733,6 +7731,7 @@ async def build_altfinder_investigation_summary(
                 model_override=ALTFINDER_EXPLAIN_MODEL or None,
                 fallback_models=ALTFINDER_FALLBACK_MODELS,
                 include_fallback_notice=False,
+                feature="altfinder_explain",
             )
         return await request_ai_completion(
             messages,
@@ -8536,6 +8535,7 @@ async def rerank_socialintel_duo_candidates_with_ai(
                 fallback_models=SOCIALINTEL_FALLBACK_MODELS,
                 response_format=_socialintel_rank_schema("socialintel_duo_rank"),
                 include_fallback_notice=False,
+                feature="socialintel_duo_rank",
             )
         else:
             raw = await request_ai_completion(
@@ -15758,6 +15758,8 @@ def should_try_fallback(status: int, raw_text: str, provider: str) -> bool:
 
 
 def friendly_ai_error(error: Exception | str) -> str:
+    if isinstance(error, groq_budget.GroqBudgetError):
+        return str(error)
     text = str(error).lower()
     if "circuit open" in text:
         return "AI is cooling down briefly after provider errors. Try again in under a minute."
@@ -15915,6 +15917,7 @@ async def request_groq_completion(
     fallback_models: list[str] | None = None,
     response_format: dict[str, Any] | None = None,
     include_fallback_notice: bool = True,
+    feature: str = "general",
 ) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is missing in .env")
@@ -15937,9 +15940,15 @@ async def request_groq_completion(
             *[model for model in ordered_fallbacks if model not in models_to_try[:1]],
             *[model for model in models_to_try[1:] if model not in ordered_fallbacks],
         ]
-    last_error = "Groq request failed."
+    models_to_try = list(dict.fromkeys(models_to_try))
+    last_model = models_to_try[-1] if models_to_try else ""
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for index, model_to_use in enumerate(models_to_try):
+
+        async def attempt(model_to_use: str) -> tuple[str, int | None]:
+            # Errors raised as ModelUnavailable/ModelRateLimited make the budget
+            # governor move on to the next model; anything else aborts.
+            is_last = model_to_use == last_model
             payload = {
                 "model": model_to_use,
                 "messages": messages,
@@ -15952,39 +15961,35 @@ async def request_groq_completion(
                 async with session.post(GROQ_API_URL, headers=headers, json=payload) as response:
                     raw_text = await response.text()
                     if response.status >= 400:
-                        last_error = (
+                        error_text = (
                             f"Groq API error `{response.status}` for `{model_to_use}`: "
                             f"{raw_text[:220]}"
                         )
-                        if index < len(models_to_try) - 1 and should_try_fallback(
-                            response.status, raw_text, "groq"
-                        ):
-                            continue
-                        raise RuntimeError(last_error)
+                        if response.status == 429:
+                            raise groq_budget.ModelRateLimited(
+                                error_text,
+                                retry_after=groq_budget.parse_retry_after(
+                                    response.headers.get("retry-after")
+                                ),
+                                daily=groq_budget.is_daily_limit_body(raw_text),
+                            )
+                        if not is_last and should_try_fallback(response.status, raw_text, "groq"):
+                            raise groq_budget.ModelUnavailable(error_text)
+                        raise RuntimeError(error_text)
                     try:
                         data = json.loads(raw_text)
                     except json.JSONDecodeError:
-                        last_error = f"Invalid JSON response from `{model_to_use}`."
-                        if index < len(models_to_try) - 1:
-                            continue
-                        raise RuntimeError(last_error)
+                        raise groq_budget.ModelUnavailable(
+                            f"Invalid JSON response from `{model_to_use}`."
+                        )
             except asyncio.TimeoutError:
-                last_error = f"Timeout from `{model_to_use}`."
-                if index < len(models_to_try) - 1:
-                    continue
-                raise RuntimeError(last_error)
+                raise groq_budget.ModelUnavailable(f"Timeout from `{model_to_use}`.")
             except aiohttp.ClientError as exc:
-                last_error = f"Network error from `{model_to_use}`: {exc}"
-                if index < len(models_to_try) - 1:
-                    continue
-                raise RuntimeError(last_error)
+                raise groq_budget.ModelUnavailable(f"Network error from `{model_to_use}`: {exc}")
 
             choices = data.get("choices", [])
             if not choices:
-                last_error = f"No choices returned from `{model_to_use}`."
-                if index < len(models_to_try) - 1:
-                    continue
-                raise RuntimeError(last_error)
+                raise groq_budget.ModelUnavailable(f"No choices returned from `{model_to_use}`.")
 
             message = choices[0].get("message", {})
             content = message.get("content", "")
@@ -15999,19 +16004,27 @@ async def request_groq_completion(
                 content = str(content)
 
             if not content:
-                last_error = f"Empty text response from `{model_to_use}`."
-                if index < len(models_to_try) - 1:
-                    continue
-                raise RuntimeError(last_error)
+                raise groq_budget.ModelUnavailable(f"Empty text response from `{model_to_use}`.")
 
-            if include_fallback_notice and model_to_use != models_to_try[0]:
-                return f"[Fallback model: `{model_to_use}`]\n\n{content.strip()}"
-            return content.strip()
+            usage = data.get("usage") if isinstance(data, dict) else None
+            total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+            return content.strip(), total_tokens if isinstance(total_tokens, int) else None
 
-    raise RuntimeError(last_error)
+        model_used, content = await GROQ_BUDGET.run(
+            models_to_try,
+            attempt,
+            feature=feature,
+            estimated_tokens=groq_budget.estimate_tokens(messages, max_tokens),
+        )
+
+    if include_fallback_notice and models_to_try and model_used != models_to_try[0]:
+        return f"[Fallback model: `{model_used}`]\n\n{content}"
+    return content
 
 
 def should_retry_ai_error(error: Exception | str) -> bool:
+    if isinstance(error, groq_budget.GroqBudgetError):
+        return False
     text = str(error).lower()
     markers = (
         "429",
@@ -16061,6 +16074,7 @@ async def request_ai_completion(
                         fallback_models=fallback_models,
                         response_format=response_format,
                         include_fallback_notice=include_fallback_notice,
+                        feature=normalized_key,
                     )
                 else:
                     output = await request_openrouter_completion(
