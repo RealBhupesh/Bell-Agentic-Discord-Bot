@@ -2,7 +2,8 @@
 proposals and engagement nudges.
 
 Everything here is OFF by default and enabled per server through the
-``"agentic"`` block of that server's entry in ``data/mod_config.json``.
+``"agentic"`` block of that server's guild settings (the ``guild_settings``
+storage document: ``data/mod_config.json`` with the default JSON backend).
 A missing block, a missing section or a missing ``enabled`` flag all mean
 "do nothing".
 

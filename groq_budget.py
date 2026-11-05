@@ -11,7 +11,17 @@ Every Groq chat-completion call made by the bot goes through
 * falling back to the next model when a model returns HTTP 429 or its budget
   is exhausted;
 * opening a circuit breaker with a clear "AI budget used up for today"
-  message once every model is exhausted.
+  message once every model is exhausted;
+* dropping paid-tier (Enterprise) models from every model chain unless
+  ``GROQ_ALLOW_ENTERPRISE_MODELS=1`` is set;
+* persisting its counters through the :mod:`storage` adapter so a restart
+  does not reset daily usage, and failing closed
+  (:class:`QuotaPersistenceError`) when the stored counters cannot be read or
+  saved.
+
+:meth:`GroqBudgetGovernor.try_admit_feature` also lets features that make no
+model call (the crush game, engagement nudges) count against a per-feature
+daily cap.
 
 The module is stdlib-only and HTTP-agnostic: callers pass an ``attempt``
 coroutine that performs the actual request for one model.
