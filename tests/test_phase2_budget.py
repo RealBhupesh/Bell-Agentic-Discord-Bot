@@ -43,7 +43,7 @@ def test_bot_defaults_have_no_enterprise_models():
         assert model not in source
     assert "moonshotai/kimi" not in source
     # Every Groq model setting goes through the gated loaders.
-    for name in ("AICRUSH", "ALTFINDER", "SOCIALINTEL"):
+    for name in ("ALTFINDER", "SOCIALINTEL"):  # aicrush was removed in phase 4
         assert re.search(rf'{name}_FALLBACK_MODELS = groq_budget\.load_model_chain\(', source)
         assert re.search(rf'{name}_EXPLAIN_MODEL = groq_budget\.load_primary_model\(', source)
         assert re.search(rf'{name}_RANK_MODEL = groq_budget\.load_primary_model\(', source)

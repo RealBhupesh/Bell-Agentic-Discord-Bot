@@ -13,8 +13,9 @@ Discord moderation bot with prefix commands (default: `&`).
 - `&lock`, `&unlock`, `&slowmode`
 - `&warn`, `&warnings`, `&clearwarns` (stored in `data/warnings.json`)
 - `&automod <on|off|toggle|status>` (moderators can control AutoMod per server)
-- `&setgenderroles <@male_role> <@female_role>` for per-server `aicrush` mapping
-- `&genderroles`, `&cleargenderroles`
+- `&crushgame <on|off|status> [#channel]` (Manage Server) enables the Crush-o-Meter game and posts a one-time fun-features notice
+- `&exclude` / `&include` opt out of (or back into) fun features; `&wipe` deletes your stored fun-feature data
+- `&legacydata [status|wipe confirm]` (bot owner only) checks for, or permanently deletes, the old aicrush data file; it is never deleted automatically
 - Auto moderation:
   - blocked words from `data/bad_words.txt`
   - link blocking
@@ -45,7 +46,7 @@ Discord moderation bot with prefix commands (default: `&`).
   - `&aimodels [limit]`
   - `&roast @user [soft|friendly|brutal]`
   - `&serverlore`
-  - `&aicrush @user`
+  - `&crush [@user] [answer]` (Crush-o-Meter joke game, see below)
   - `&analyze @user`
   - `&lie_detector @user <message>`
   - `&futureme`
@@ -140,10 +141,9 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `VIBE_MIN_REQUIRED_MESSAGES=25`
 - `VIBE_MAX_PROMPT_MESSAGES=80`
 - `VIBE_MAX_PROMPT_CHARS=12000`
-- `AICRUSH_SCAN_PER_CHANNEL=450` (used when full-history scan is disabled)
+- `AICRUSH_SCAN_PER_CHANNEL=450` (shared history-scan tuning for roast; the old aicrush command is gone)
 - `AICRUSH_MAX_CHANNELS=0` (`0` means scan all visible text channels)
 - `AICRUSH_FULL_HISTORY_SCAN=true`
-- `AICRUSH_MAX_CONTEXT_CHARS=16000`
 - `AICRUSH_MAX_HISTORY_MESSAGES=12000` (per-run safety cap)
 - `AICRUSH_SCAN_PAUSE_EVERY=260` (small pacing interval)
 - `AICRUSH_SCAN_PAUSE_SECONDS=0.12` (sleep duration for pacing)
@@ -187,10 +187,8 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `BUSINESS_CAPITAL_GAINS_LONG_RATE=0.10`
 - `BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS=7`
 - `BUSINESS_INCOME_TAX_ENABLED=true`
-- `MALE_ROLE_IDS=` (comma-separated role IDs for strict aicrush gender detection)
-- `FEMALE_ROLE_IDS=` (comma-separated role IDs for strict aicrush gender detection)
-- `MALE_ROLE_HINTS=` (optional extra keywords)
-- `FEMALE_ROLE_HINTS=` (optional extra keywords)
+- `CRUSH_GAME_DAILY_CAP=50` (bot-wide daily cap for `&crush`, enforced by the budget governor)
+- `CRUSH_GAME_FLAVOR_DAILY_CAP=50` (daily cap for the optional one-line AI joke, Groq only)
 - `VOICE_CONNECT_RETRIES=4`
 - `VOICE_CONNECT_TIMEOUT=25`
 - `VOICE_INTERNAL_RECONNECT=false`
@@ -241,7 +239,7 @@ Every Groq chat completion goes through `groq_budget.py`, which keeps the bot in
 - Per-model token buckets for RPM/RPD/TPM/TPD (`GROQ_LIMIT_*`; per-model overrides via
   `GROQ_MODEL_LIMITS=model=rpm:rpd:tpm:tpd;other=...`).
 - FIFO request queue: a short wait for minute budgets (up to `GROQ_BUDGET_MAX_WAIT_SECONDS`) is spent in line.
-- Optional per-feature daily caps: `GROQ_FEATURE_DAILY_CAPS=ai_chat=300,aicrush_explain=50`
+- Optional per-feature daily caps: `GROQ_FEATURE_DAILY_CAPS=ai_chat=300,crush_game=50`
   (feature names are the AI `policy_key`s; `GROQ_FEATURE_DAILY_CAP_DEFAULT=0` means unlimited).
 - Automatic fallback to the next model on HTTP 429 or an exhausted budget.
 - When every model is out of budget, AI commands reply "AI budget used up for today" without calling Groq.
@@ -333,3 +331,24 @@ Depending on which commands you use:
 - Optional LLM market director can safely nudge economy values (market bias, event chance, small tax/fee shifts) within bounded ranges.
 - Optional LLM advisor adds personalized one-line strategy tips in business commands with cache to avoid lag.
 - If vibe AI times out, the bot falls back to a local heuristic narrative summary.
+
+## Crush-o-Meter game (phase 4)
+
+`&crush` replaced the old `&aicrush`, which mined members' message history. The new game:
+
+- Is about the person who runs it. It only uses what you deliberately give it: `&crush <answer>`
+  (your answer to a fun prompt), or one of **your own** messages you reply to while running it.
+- `&crush @member` is a random dice-roll pairing, and the result says so. Nothing about that
+  member (messages, activity, roles) is looked at, and nobody is assigned real feelings.
+  Without a member, you are paired with a fictional character.
+- Never reads DMs, never scans history, and does not tally anyone's messages.
+- Off by default. A moderator runs `&crushgame on #channel`; the first time, the bot posts one
+  notice in that channel naming `&exclude` and `&wipe`. Re-enabling never re-posts it.
+- `&exclude` (any time): you can't be named or play, your saved answer is deleted, and other
+  member-targeted fun commands (`roast`, `analyze`, `vibe`, `vibecheck`, `lie_detector`, `debate`,
+  `myvibe`) refuse to analyze you. `&include` undoes it. `&wipe` deletes your saved answer.
+- Every result ends with a fixed "just a joke" disclaimer, and every play counts against the
+  `crush_game` daily cap in the budget governor.
+- The legacy `data/aicrush_state.json` (and its backup) from the old feature is no longer read
+  or written, and is **not** deleted automatically. The bot owner can check it with
+  `&legacydata status` and delete it with `&legacydata wipe confirm` (owner-only, irreversible).
