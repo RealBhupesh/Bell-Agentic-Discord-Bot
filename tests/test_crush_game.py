@@ -391,6 +391,26 @@ def test_disclaimer_present_in_every_result():
     assert "joke" in lowered and "not anyone's real" in lowered and "orientation" in lowered
 
 
+def test_disclaimer_and_notice_describe_analysis_accurately():
+    """The player's own deliberate input IS analyzed; history and other members' messages never are."""
+    s = Setup()
+    s.enable()
+    notice = s.channel.sent[0]
+    result = s.play(s.alice, s.bob, answer="MY OWN WORDS!!")  # the player's input is analyzed
+    for text in (cg.DISCLAIMER, notice, result):
+        lowered = text.lower()
+        assert "nobody's messages were analyzed" not in lowered
+        assert "no messages were analyzed" not in lowered
+    for text in (cg.DISCLAIMER, notice):
+        lowered = " ".join(text.lower().split())
+        assert "message history" in lowered
+        assert "other member's messages" in lowered
+        assert "deliberately" in lowered
+    assert "never analyzes message history or any other member's messages" in " ".join(notice.split())
+    assert "No message history and no other member's messages are ever analyzed" in cg.DISCLAIMER
+    assert "only what the player deliberately gave the game" in cg.DISCLAIMER
+
+
 def test_romantic_or_orientation_flavor_is_dropped():
     async def flavor(prompt: str) -> str:
         return "Alice secretly likes Bob and is in love, judging by how she chats with him."

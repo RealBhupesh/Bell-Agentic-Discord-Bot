@@ -44,7 +44,8 @@ ANSWER_MAX_CHARS = 120
 
 DISCLAIMER = (
     "🎲 Just a joke game! These results are random silly fun, NOT anyone's real "
-    "feelings, relationships or orientation. Nobody's messages were analyzed."
+    "feelings, relationships or orientation. No message history and no other member's "
+    "messages are ever analyzed, only what the player deliberately gave the game."
 )
 
 FUN_PROMPT = "What snack, song or emoji sums up your vibe today?"
@@ -225,9 +226,10 @@ class CrushGame:
         return (
             "📢 **Fun features notice**\n"
             "This server turned on the bot's fun features. Fun features can read messages in "
-            "server channels the bot can see (never DMs). The Crush-o-Meter game itself only uses "
-            f"what you give it: your answer (`{p}crush <answer>`) or your own message you reply to. "
-            "If it names someone else, that pairing is a random dice roll, not an analysis.\n"
+            "server channels the bot can see (never DMs). The Crush-o-Meter game never analyzes "
+            "message history or any other member's messages. It only analyzes what you "
+            f"deliberately give it: your answer (`{p}crush <answer>`) or your own message you reply "
+            "to. If it names someone else, that pairing is a random dice roll, not an analysis.\n"
             f"• Opt out at any time: `{p}exclude` (you will never be analyzed or named, "
             "and your stored fun-feature data is deleted)\n"
             f"• Delete your stored data at any time: `{p}wipe`\n"
