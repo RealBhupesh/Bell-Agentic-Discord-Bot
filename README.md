@@ -220,6 +220,7 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `GROQ_DEFAULT_RETRY_AFTER_SECONDS=60`
 - `GROQ_QUEUE_MAX=100`
 - `GROQ_BUDGET_STATE_FILE=` (default `data/groq_budget_state.json`)
+- `DATABASE_URL=` (empty = JSON files under `data/`; see [Storage](#storage-phase-5))
 - `GROQ_ALLOW_ENTERPRISE_MODELS=0`
 - `AGENT_DAILY_CAP=20`
 - `AGENT_MAX_TOKENS=500`
@@ -243,11 +244,93 @@ Every Groq chat completion goes through `groq_budget.py`, which keeps the bot in
   (feature names are the AI `policy_key`s; `GROQ_FEATURE_DAILY_CAP_DEFAULT=0` means unlimited).
 - Automatic fallback to the next model on HTTP 429 or an exhausted budget.
 - When every model is out of budget, AI commands reply "AI budget used up for today" without calling Groq.
-- Usage counters are saved to `GROQ_BUDGET_STATE_FILE` (atomic JSON writes after every change) and
-  loaded on start, so a restart does not reset daily allowances. One bot process per state file is assumed.
+- Usage counters are saved through the storage adapter (default: `GROQ_BUDGET_STATE_FILE`, atomic JSON
+  writes after every change) and loaded on start, so a restart does not reset daily allowances. With the
+  default JSON file one bot process per state file is assumed; counters are only multi-process safe when
+  `DATABASE_URL` is configured (see [Storage](#storage-phase-5)).
+- The governor fails closed on counter persistence problems. If saving the counters fails, or a stored
+  counter file exists but is unreadable/corrupt, new AI requests (and capped non-AI features) are refused
+  with "AI is paused: the bot could not safely record its usage limits" instead of running on reset
+  counters. A missing counter file (fresh install) is normal. Requests resume automatically once a save
+  succeeds again, or once the owner restores a good counter file or deletes the broken one (deleting it
+  means accepting fresh counters).
 - Default model chains use only free-tier models. Enterprise-tier models (`llama-3.3-70b-versatile`,
   `llama-3.1-8b-instant`, `moonshotai/kimi-k2-*`) are dropped from every chain, including env-provided ones,
   unless `GROQ_ALLOW_ENTERPRISE_MODELS=1`.
+
+## Storage (phase 5)
+
+All persistent state goes through `storage.py`. Every state area is one JSON document under a short key;
+no feature reads or writes the JSON files directly. Two backends implement the same interface
+(`get`/`set`/`delete`/`list_keys`/`update`/`version`, plus async `aget`/`aset`/`adelete`/`alist_keys`/`aupdate`):
+
+- `JsonFileBackend` (default): the same files and formats as before. Writes go to a temp file and are
+  moved into place with `os.replace`. A state file is never written in place: if the temp write or the
+  replace fails (e.g. disk full), the last good file is kept, the temp file is removed and the write
+  reports failure. Most areas are also mirrored to `<file>.bak` the same way, which is read when the main
+  file is empty or corrupt.
+  Missing files are seeded with the same defaults as before.
+- `PostgresBackend`: used only when `DATABASE_URL` is set. Needs `asyncpg` (in `requirements.txt`, but
+  imported lazily, so the bot runs without it). Nothing connects until the first storage call.
+
+### Storage layout
+
+| key | file (JSON backend) | format | `.bak` | table (Postgres) | contents |
+| --- | --- | --- | --- | --- | --- |
+| `guild_settings` | `data/mod_config.json` | indent=2 | yes | `bell_guild_settings` | Per-guild settings: moderation config, mod-log channel, feature toggles and the agentic automation config block (`agentic`). |
+| `warnings` | `data/warnings.json` | indent=2 | yes | `bell_warnings` | Manual moderator warnings per guild/user. |
+| `mod_log` | `data/ai_mod_state.json` | indent=2 | yes | `bell_mod_log` | AI moderation case log: cases, appeals, review actions, user risk, metrics. |
+| `engagement` | `data/engagement_state.json` | indent=2 | yes | `bell_engagement` | XP, levels, streaks, daily quests per guild member. |
+| `economy` | `data/business_state.json` | indent=2 | yes | `bell_economy` | Economy / business simulation state. |
+| `altfinder` | `data/altfinder_state.json` | indent=2 | yes | `bell_altfinder` | Alt-account detection state. |
+| `socialintel` | `data/socialintel_state.json` | indent=2 | yes | `bell_socialintel` | Social graph / interaction statistics. |
+| `capabilities_overrides` | `data/capabilities_overrides.json` | indent=2 | no | `bell_capabilities_overrides` | Owner overrides for the capability catalog. |
+| `capabilities_catalog` | `data/capabilities_catalog.json` | indent=2 | no | `bell_capabilities_catalog` | Generated capability catalog (rebuilt from commands; cache). |
+| `crush_game` | `data/crush_game.json` | indent=2 | yes | `bell_crush_game` | Consent-first crush joke game state. |
+| `agentic_state` | `data/agentic_state.json` | indent=2 | yes | `bell_agentic_state` | Agentic automation runtime state: scheduled tasks, escalation proposals, nudge history. |
+| `groq_budget` | `data/groq_budget_state.json` (or `GROQ_BUDGET_STATE_FILE`) | compact, sorted keys, fsync | no | `bell_groq_budget` | Groq budget governor counters (token buckets, feature caps, circuit breaker). |
+
+`data/bad_words.txt` is a plain text word list and stays a file. `data/aicrush_state.json` (removed
+history-mining feature) is never read or migrated; only the owner command `&legacydata wipe confirm` deletes it.
+
+### Schema
+
+`db/schema.sql` creates (idempotently):
+
+- `bell_documents(doc_name PRIMARY KEY, version, updated_at)`: which documents exist; `version` increments on
+  every write and is the cache token for the capability catalog.
+- One table per area (names above), each `(doc_key TEXT PRIMARY KEY, position INTEGER, value JSONB)`: one row
+  per top-level key of the document (e.g. one row per guild id in `bell_guild_settings`), with `position`
+  keeping the original key order. A document is read back as `{doc_key: value, ...}`, equal to the JSON file.
+  JSONB normalises the key order *inside* nested objects; values and dict equality are unchanged.
+
+Writes replace the area's rows in one transaction. `update()` (read-modify-write) holds a per-document
+`pg_advisory_xact_lock`, which is what makes the Groq budget counters safe to share between several bot
+processes. With the JSON backend the counters stay single-process, exactly as before.
+
+### Migrating to Postgres later
+
+Nothing in this repository connects to a database by default. When you decide to move, with the bot **stopped**:
+
+1. Back up the JSON state: `cp -r data data.backup-$(date +%Y%m%d)`
+2. Install the driver: `pip install -r requirements.txt`
+3. Preview what would be copied (reads files only, no database connection):
+   `python db/migrate_json_to_postgres.py --dry-run`
+   (add `--data-dir PATH` if your data lives elsewhere, `--json` for machine-readable output; a custom
+   `GROQ_BUDGET_STATE_FILE` is picked up from the environment or `--groq-budget-file PATH`).
+   Fix any area reported as `unreadable` before continuing.
+4. Create an empty PostgreSQL database and a user for the bot, then put the connection string in `.env`
+   (never commit it): `DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME`
+5. Create the tables and copy the data (the URL is read from the environment only and never printed):
+   `set -a; . ./.env; set +a; python db/migrate_json_to_postgres.py --apply-schema`
+   Each area is read back and compared after writing (`migrated <key>: N rows -> <table> (verified)`).
+   Areas already present in the database are skipped unless you pass `--overwrite`.
+   (Equivalent for the schema step: `psql "$DATABASE_URL" -f db/schema.sql`.)
+6. Start the bot with `DATABASE_URL` set. It now reads and writes Postgres; the JSON files are left untouched
+   as a fallback.
+
+To roll back, stop the bot and clear `DATABASE_URL`; it uses the JSON files again (changes made while on
+Postgres are not copied back).
 
 ## Agent
 

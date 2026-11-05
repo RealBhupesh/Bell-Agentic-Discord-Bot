@@ -31,7 +31,7 @@ def bot_source() -> str:
 def crush_section() -> str:
     source = bot_source()
     start = source.index("# Crush-o-Meter game (phase 4)")
-    end = source.index('AGENTIC_STATE_FILE = DATA_DIR / "agentic_state.json"')
+    end = source.index("AGENTIC_STATE = agentic_automation.AgenticState()")
     return source[start:end]
 
 
@@ -343,8 +343,8 @@ def test_legacy_aicrush_file_is_not_read_or_deleted_at_startup():
     loader = source.split("def load_crush_game_state()", 1)[1].split("\ndef ", 1)[0]
     assert "LEGACY_AICRUSH" not in loader and "delete_legacy" not in loader
     # The legacy reader is gone: nothing opens, creates or deletes the file automatically.
-    assert source.count("LEGACY_AICRUSH_STATE_FILE") == 3  # definition + two uses in the owner-only path helper
-    assert "read_json(LEGACY_AICRUSH_STATE_FILE" not in source
+    assert source.count("LEGACY_AICRUSH_STATE_KEY") == 2  # definition + one use in the owner-only path helper
+    assert "read_state(LEGACY_AICRUSH_STATE_KEY" not in source
     assert "AICRUSH_STATE_FILE.write_text" not in source
     assert not hasattr(cg, "purge_legacy_files")
 

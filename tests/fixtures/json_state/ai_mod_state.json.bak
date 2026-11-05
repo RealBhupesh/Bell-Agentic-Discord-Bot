@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "CASE-000001": {
+      "guild_id": 111111111111111111,
+      "category": "spam_flood",
+      "risk_score": 0.82
+    }
+  },
+  "appeals": {},
+  "review_actions": [],
+  "user_risk": {},
+  "metrics": {
+    "evaluated": 10,
+    "cases_created": 1,
+    "enforced": 0,
+    "overrides": 0,
+    "appeals": 0
+  },
+  "meta": {
+    "next_case": 2,
+    "next_appeal": 1,
+    "last_prune_ts": 0.0
+  }
+}
