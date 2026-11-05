@@ -184,3 +184,195 @@ def test_feature_admission_without_model_call_is_persisted(tmp_path):
     assert not gov.try_admit_feature("nudge")
     reloaded = make_gov(Clocks(), storage_backend=storage.JsonFileBackend(tmp_path / "data"), feature_caps={"nudge": 2})
     assert reloaded.feature_usage("nudge") == 2
+
+
+# ---------------------------------------------------------------------------
+# Fail closed on quota persistence failure
+# ---------------------------------------------------------------------------
+
+from groq_budget import QuotaPersistenceError  # noqa: E402
+
+
+def _break_replace(monkeypatch):
+    real = storage.os.replace
+
+    def failing(src, dst):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(storage.os, "replace", failing)
+    return real
+
+
+class FlakyBackend(storage.JsonFileBackend):
+    """JSON backend whose set() can be told to return False or raise."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.mode = "ok"
+
+    def set(self, key, value):
+        if self.mode == "false":
+            return False
+        if self.mode == "raise":
+            raise RuntimeError("storage down")
+        return super().set(key, value)
+
+
+def test_missing_state_file_allows_normal_operation(tmp_path):
+    backend = storage.JsonFileBackend(tmp_path / "data")
+    assert not backend.exists("groq_budget")
+    gov = make_gov(Clocks(), storage_backend=backend)
+    assert gov.persistence_healthy
+    serve(gov, 2)
+    assert backend.get("groq_budget")["features"]["agent"]["used"] == 2
+
+
+@pytest.mark.parametrize("mode", ["false", "raise"])
+def test_save_failure_blocks_subsequent_provider_requests(tmp_path, mode):
+    backend = FlakyBackend(tmp_path / "data")
+    gov = make_gov(Clocks(), storage_backend=backend)
+    serve(gov, 1)
+    backend.mode = mode
+    calls = []
+
+    async def attempt(model):
+        calls.append(model)
+        return "ok", None
+
+    async def go():
+        return await gov.run(["m1"], attempt, feature="agent", estimated_tokens=10)
+
+    # The admission is counted in memory, its save fails, and the request is refused
+    # before any provider call; so is every later one while saving keeps failing.
+    with pytest.raises(QuotaPersistenceError):
+        asyncio.run(go())
+    with pytest.raises(QuotaPersistenceError):
+        asyncio.run(go())
+    assert calls == []
+    assert not gov.persistence_healthy
+    assert gov.try_admit_feature("nudge") is False  # non-model features fail closed too
+
+
+def test_save_failure_from_failed_atomic_replace_blocks_requests(tmp_path, monkeypatch):
+    backend = storage.JsonFileBackend(tmp_path / "data")
+    gov = make_gov(Clocks(), storage_backend=backend)
+    serve(gov, 1)
+    path = tmp_path / "data" / "groq_budget_state.json"
+    good = path.read_bytes()
+    _break_replace(monkeypatch)
+    with pytest.raises(QuotaPersistenceError):
+        serve(gov, 1)
+    assert path.read_bytes() == good  # last good counters preserved
+
+
+def test_later_successful_save_recovers(tmp_path):
+    backend = FlakyBackend(tmp_path / "data")
+    gov = make_gov(Clocks(), storage_backend=backend)
+    serve(gov, 1)
+    backend.mode = "false"
+    with pytest.raises(QuotaPersistenceError):
+        serve(gov, 1)
+    backend.mode = "ok"
+    serve(gov, 1)  # the gate retries the save, it succeeds, normal operation resumes
+    assert gov.persistence_healthy
+    # Usage counted while saving failed was kept, not reset.
+    stored = backend.get("groq_budget")
+    assert stored["features"]["agent"]["used"] == gov.feature_usage("agent") >= 2
+    assert make_gov(Clocks(), storage_backend=storage.JsonFileBackend(tmp_path / "data")).feature_usage("agent") == (
+        gov.feature_usage("agent")
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{not json", "[1, 2]", '{"version": 999, "features": {}}'],
+    ids=["corrupt", "not-an-object", "unknown-version"],
+)
+def test_corrupt_existing_state_blocks_requests(tmp_path, content):
+    path = tmp_path / "data" / "groq_budget_state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(content, encoding="utf-8")
+    gov = make_gov(Clocks(), storage_backend=storage.JsonFileBackend(tmp_path / "data"))
+    assert not gov.persistence_healthy
+    with pytest.raises(QuotaPersistenceError):
+        serve(gov, 1)
+    assert gov.try_admit_feature("agent") is False
+    assert path.read_text(encoding="utf-8") == content  # never replaced by zeroed counters
+
+
+def test_fixing_or_removing_corrupt_state_recovers(tmp_path):
+    path = tmp_path / "data" / "groq_budget_state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+    clocks = Clocks()
+    gov = make_gov(clocks, storage_backend=storage.JsonFileBackend(tmp_path / "data"))
+    with pytest.raises(QuotaPersistenceError):
+        serve(gov, 1)
+
+    # Owner restores a good copy: its counters are honoured.
+    donor = make_gov(clocks, storage_backend=storage.JsonFileBackend(tmp_path / "donor"))
+    serve(donor, 3)
+    path.write_bytes((tmp_path / "donor" / "groq_budget_state.json").read_bytes())
+    serve(gov, 1)
+    assert gov.persistence_healthy and gov.feature_usage("agent") == 4
+
+    # Or deletes it deliberately: treated as a fresh install.
+    path.write_text("{not json", encoding="utf-8")
+    other = make_gov(clocks, storage_backend=storage.JsonFileBackend(tmp_path / "data"))
+    with pytest.raises(QuotaPersistenceError):
+        serve(other, 1)
+    path.unlink()
+    serve(other, 1)
+    assert other.persistence_healthy and other.feature_usage("agent") == 1
+
+
+class BrokenSharedBackend(SharedMemoryBackend):
+    def __init__(self):
+        super().__init__()
+        self.fail_updates = False
+        self.fail_reads = False
+
+    def get(self, key):
+        if self.fail_reads:
+            raise RuntimeError("database unreachable")
+        return super().get(key)
+
+    def update(self, key, fn):
+        if self.fail_updates:
+            raise RuntimeError("database unreachable")
+        return super().update(key, fn)
+
+
+def test_shared_backend_update_failure_blocks_and_recovers():
+    shared = BrokenSharedBackend()
+    gov = make_gov(Clocks(), storage_backend=shared)
+    serve(gov, 1)
+    shared.fail_updates = True
+    with pytest.raises(QuotaPersistenceError):
+        serve(gov, 1)
+    assert shared.get("groq_budget")["features"]["agent"]["used"] == 1
+    shared.fail_updates = False
+    serve(gov, 1)
+    assert gov.persistence_healthy
+    assert shared.get("groq_budget")["features"]["agent"]["used"] == 2
+
+
+def test_shared_backend_read_failure_blocks_requests():
+    shared = BrokenSharedBackend()
+    gov = make_gov(Clocks(), storage_backend=shared)
+    serve(gov, 1)
+    shared.fail_reads = True
+    with pytest.raises(QuotaPersistenceError):
+        serve(gov, 1)
+    shared.fail_reads = False
+    serve(gov, 1)
+    assert shared.get("groq_budget")["features"]["agent"]["used"] == 2
+
+
+def test_feature_cap_errors_are_not_mistaken_for_persistence_failures():
+    shared = SharedMemoryBackend()
+    gov = make_gov(Clocks(), storage_backend=shared, feature_caps={"agent": 1})
+    serve(gov, 1)
+    with pytest.raises(FeatureCapExceededError):
+        serve(gov, 1)
+    assert gov.persistence_healthy

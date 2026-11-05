@@ -205,17 +205,66 @@ def test_writes_leave_no_temp_files(backend):
     assert names == ["engagement_state.json", "engagement_state.json.bak", "groq_budget_state.json"]
 
 
-def test_atomic_replace_failure_falls_back_to_direct_write(backend, monkeypatch):
-    real_replace = os.replace
-
+def _fail_replace(monkeypatch):
     def failing_replace(src, dst):
-        raise OSError(18, "cross-device")
+        raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(storage.os, "replace", failing_replace)
-    assert backend.set("warnings", {"x": 1}) is True
+
+
+def test_atomic_replace_failure_preserves_last_good_and_fails(backend, monkeypatch):
+    assert backend.set("warnings", {"last": "good"}) is True
+    primary = backend.data_dir / "warnings.json"
+    backup = backend.data_dir / "warnings.json.bak"
+    good_primary, good_backup = primary.read_bytes(), backup.read_bytes()
+
+    _fail_replace(monkeypatch)
+    assert backend.set("warnings", {"new": "data"}) is False  # (a)
+    assert primary.read_bytes() == good_primary  # (b) last good data preserved
+    assert backup.read_bytes() == good_backup
+    assert any("atomic_replace" in line and "PERSISTENCE ERROR" in line for line in backend.logs)  # (c)
+    assert not [p for p in backend.data_dir.iterdir() if ".tmp-" in p.name]  # (d)
+    assert backend.get("warnings") == {"last": "good"}
+
+
+def test_atomic_replace_failure_never_creates_a_missing_target(backend, monkeypatch):
+    _fail_replace(monkeypatch)
+    assert backend.set("crush_game", {"guilds": {}}) is False
+    assert not backend.data_dir.exists() or not list(backend.data_dir.iterdir())
+    assert backend.ensure_default("warnings") is False
+    assert not (backend.data_dir / "warnings.json").exists()
+
+
+def test_backup_replace_failure_is_logged_and_never_direct_written(backend, monkeypatch):
+    assert backend.set("economy", {"v": 1}) is True
+    backup = backend.data_dir / "business_state.json.bak"
+    good_backup = backup.read_bytes()
+    real_replace = os.replace
+
+    def fail_for_backup(src, dst):
+        if str(dst).endswith(".bak"):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", fail_for_backup)
+    assert backend.set("economy", {"v": 2}) is True  # primary written atomically
+    assert json.loads((backend.data_dir / "business_state.json").read_text()) == {"v": 2}
+    assert backup.read_bytes() == good_backup  # backup left at its last good content
+    assert any("JSON BACKUP WRITE ERROR" in line for line in backend.logs)
+    assert not [p for p in backend.data_dir.iterdir() if ".tmp-" in p.name]
+
+
+def test_set_succeeds_again_after_replace_recovers(backend, monkeypatch):
+    backend.set("warnings", {"last": "good"})
+    real_replace = os.replace
+    _fail_replace(monkeypatch)
+    assert backend.set("warnings", {"lost": True}) is False
     monkeypatch.setattr(storage.os, "replace", real_replace)
-    assert backend.get("warnings") == {"x": 1}
-    assert any("atomic_replace" in line for line in backend.logs)
+    assert backend.set("warnings", {"new": "data"}) is True
+    expected = json.dumps({"new": "data"}, indent=2)
+    assert (backend.data_dir / "warnings.json").read_text(encoding="utf-8") == expected
+    assert (backend.data_dir / "warnings.json.bak").read_text(encoding="utf-8") == expected
+    assert backend.get("warnings") == {"new": "data"}
     assert not [p for p in backend.data_dir.iterdir() if ".tmp-" in p.name]
 
 

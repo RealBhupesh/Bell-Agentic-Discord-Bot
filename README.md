@@ -248,6 +248,12 @@ Every Groq chat completion goes through `groq_budget.py`, which keeps the bot in
   writes after every change) and loaded on start, so a restart does not reset daily allowances. With the
   default JSON file one bot process per state file is assumed; counters are only multi-process safe when
   `DATABASE_URL` is configured (see [Storage](#storage-phase-5)).
+- The governor fails closed on counter persistence problems. If saving the counters fails, or a stored
+  counter file exists but is unreadable/corrupt, new AI requests (and capped non-AI features) are refused
+  with "AI is paused: the bot could not safely record its usage limits" instead of running on reset
+  counters. A missing counter file (fresh install) is normal. Requests resume automatically once a save
+  succeeds again, or once the owner restores a good counter file or deletes the broken one (deleting it
+  means accepting fresh counters).
 - Default model chains use only free-tier models. Enterprise-tier models (`llama-3.3-70b-versatile`,
   `llama-3.1-8b-instant`, `moonshotai/kimi-k2-*`) are dropped from every chain, including env-provided ones,
   unless `GROQ_ALLOW_ENTERPRISE_MODELS=1`.
@@ -259,8 +265,10 @@ no feature reads or writes the JSON files directly. Two backends implement the s
 (`get`/`set`/`delete`/`list_keys`/`update`/`version`, plus async `aget`/`aset`/`adelete`/`alist_keys`/`aupdate`):
 
 - `JsonFileBackend` (default): the same files and formats as before. Writes go to a temp file and are
-  moved into place with `os.replace` (falling back to a direct write where a filesystem cannot replace);
-  most areas are also mirrored to `<file>.bak`, which is read when the main file is empty or corrupt.
+  moved into place with `os.replace`. A state file is never written in place: if the temp write or the
+  replace fails (e.g. disk full), the last good file is kept, the temp file is removed and the write
+  reports failure. Most areas are also mirrored to `<file>.bak` the same way, which is read when the main
+  file is empty or corrupt.
   Missing files are seeded with the same defaults as before.
 - `PostgresBackend`: used only when `DATABASE_URL` is set. Needs `asyncpg` (in `requirements.txt`, but
   imported lazily, so the bot runs without it). Nothing connects until the first storage call.

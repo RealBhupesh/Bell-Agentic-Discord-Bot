@@ -322,18 +322,14 @@ class JsonFileBackend(StorageBackend):
             f"errno=`{getattr(error, 'errno', 'unknown')}` detail=`{error}`"
         )
 
-    def _log_atomic_fallback(self, path: Path, error: OSError) -> None:
-        """Warn that a write lost its atomicity (durability degradation)."""
-        key = f"atomic_replace:{path}:{getattr(error, 'errno', 'unknown')}"
-        if not self._should_log(key):
-            return
-        self._log(
-            f"[PERSISTENCE WARNING] atomic_replace failed, falling back to direct write: path=`{path}` "
-            f"errno=`{getattr(error, 'errno', 'unknown')}` detail=`{error}`"
-        )
-
     def _write_text_atomic(self, path: Path, text: str) -> tuple[bool, OSError | None]:
-        """Temp file + ``os.replace``; falls back to a direct write where replace fails."""
+        """Write ``text`` to ``path`` via a temp file + ``os.replace``, or not at all.
+
+        The target is never opened for writing directly: if the temp write or
+        the replace fails (disk full, cross-device, permissions...), the last
+        good file is left untouched, the temp file is removed and
+        ``(False, error)`` is returned.
+        """
         temp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -341,18 +337,7 @@ class JsonFileBackend(StorageBackend):
             os.replace(temp_path, path)
             return True, None
         except OSError as error:
-            self._log_atomic_fallback(path, error)
-            try:
-                path.write_text(text, encoding="utf-8")
-                try:
-                    if temp_path.exists():
-                        temp_path.unlink()
-                except OSError:
-                    pass
-                return True, None
-            except OSError as fallback_error:
-                self._log_persistence_error(path, "direct_write", fallback_error)
-                error = fallback_error
+            self._log_persistence_error(path, "atomic_replace", error)
             try:
                 if temp_path.exists():
                     temp_path.unlink()
@@ -472,9 +457,8 @@ class JsonFileBackend(StorageBackend):
                 return False
         else:
             text = json.dumps(value, indent=2)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        return True
+        ok, _error = self._write_text_atomic(path, text)
+        return ok
 
 
 def atomic_write_json(path: str | os.PathLike[str], payload: Any) -> None:

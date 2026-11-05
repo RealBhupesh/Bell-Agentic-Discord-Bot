@@ -202,13 +202,14 @@ def test_atomic_write_keeps_old_file_on_failure(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["f.json"]
 
 
-def test_corrupt_state_file_is_ignored(tmp_path):
+def test_corrupt_state_file_fails_closed(tmp_path):
+    # Phase 5: an existing but unreadable state file must not reset usage to zero.
     path = tmp_path / "budget.json"
     path.write_text("{not json")
     gov = make_gov(path, Clocks())
-    assert gov.feature_usage("agent") == 0
-    serve(gov, 1)
-    assert json.loads(path.read_text())["features"]["agent"]["used"] == 1
+    with pytest.raises(groq_budget.QuotaPersistenceError):
+        serve(gov, 1)
+    assert path.read_text() == "{not json"  # never overwritten with fresh counters
 
 
 def test_no_state_file_without_path(tmp_path, monkeypatch):

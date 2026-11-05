@@ -131,6 +131,9 @@ BUDGET_EXHAUSTED_MESSAGE = "AI budget used up for today. Please try again later.
 FEATURE_CAP_MESSAGE = "Daily AI limit for this feature has been reached. Please try again tomorrow."
 QUEUE_FULL_MESSAGE = "Too many AI requests are queued right now. Please try again in a minute."
 COOLDOWN_MESSAGE = "AI has hit its per-minute limit. Please try again in about {seconds}s."
+QUOTA_PERSISTENCE_MESSAGE = (
+    "AI is paused: the bot could not safely record its usage limits. Please tell the bot owner."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +165,19 @@ class BudgetCoolingDownError(GroqBudgetError):
 class QueueFullError(GroqBudgetError):
     def __init__(self, message: str = QUEUE_FULL_MESSAGE) -> None:
         super().__init__(message)
+
+
+class QuotaPersistenceError(GroqBudgetError):
+    """Usage counters could not be saved, or the stored ones could not be read.
+
+    The governor fails closed: no new provider request is admitted until the
+    counters are known and persisted again, so a restart can never reset usage
+    to zero and let the bot blow past its daily caps.
+    """
+
+    def __init__(self, reason: str, message: str = QUOTA_PERSISTENCE_MESSAGE) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class ModelRateLimited(Exception):
@@ -387,6 +403,9 @@ class GroqBudgetGovernor:
             )
         self.storage = storage_backend
         self.storage_key = storage_key
+        # Fail-closed flags: stored counters exist but cannot be read, or the last save failed.
+        self._load_failed = False
+        self._save_failed = False
         if self.storage is not None:
             self._load_state()
 
@@ -484,8 +503,9 @@ class GroqBudgetGovernor:
         """
         key = (feature or "general").strip().lower() or "general"
         try:
+            self._ensure_persistence_ok()
             self._admit_feature(key)
-        except FeatureCapExceededError:
+        except (FeatureCapExceededError, QuotaPersistenceError):
             return False
         return True
 
@@ -498,7 +518,10 @@ class GroqBudgetGovernor:
             return False
 
         if self.shared:
-            self._mutate(refund)
+            try:
+                self._mutate(refund)
+            except QuotaPersistenceError:
+                pass  # already marked unhealthy; keep the caller's original error
         elif refund():
             self._save_state()
 
@@ -541,7 +564,7 @@ class GroqBudgetGovernor:
         """
         await self._acquire_turn()
         try:
-            self._refresh()
+            self._ensure_persistence_ok()
             state = self._state(model)
             wait = state.wait_time(tokens, self._clock())
             if wait > self.max_wait_seconds:
@@ -700,36 +723,86 @@ class GroqBudgetGovernor:
         return bool(self.storage is not None and self.storage.shared)
 
     def _load_state(self) -> None:
+        """Load stored counters, failing closed when they exist but can't be read.
+
+        * nothing stored yet (fresh install) -> start with full budgets;
+        * stored and readable -> restore them;
+        * stored but unreadable/corrupt/unknown version, or the backend errors ->
+          :attr:`_load_failed` is set and every new request raises
+          :class:`QuotaPersistenceError` (counters are never reset to zero).
+        """
         if self.storage is None:
             return
         try:
             payload = self.storage.get(self.storage_key)
-        except Exception as error:  # noqa: BLE001 - never let storage break AI calls
-            print(f"[GROQ BUDGET] Could not load counters: {type(error).__name__}: {error}")
+            exists = payload is not None or self.storage.exists(self.storage_key)
+        except Exception as error:  # noqa: BLE001
+            self._mark_load_failed(f"{type(error).__name__}: {error}")
             return
-        if payload is not None:
-            self.import_state(payload)
+        if payload is None:
+            if exists:
+                self._mark_load_failed("stored counters are unreadable or corrupt")
+                return
+            self._load_failed = False  # fresh install
+            return
+        if not isinstance(payload, Mapping) or payload.get("version") != self.STATE_VERSION:
+            self._mark_load_failed("stored counters have an unknown format/version")
+            return
+        self.import_state(payload)
+        self._load_failed = False
 
-    def _save_state(self) -> None:
+    def _mark_load_failed(self, reason: str) -> None:
+        if not self._load_failed:
+            print(f"[GROQ BUDGET] Usage counters unreadable; AI requests are blocked until fixed: {reason}")
+        self._load_failed = True
+
+    def _save_state(self) -> bool:
+        """Persist the counters; returns False (and marks persistence unhealthy) on failure."""
         if self.storage is None:
-            return
+            return True
+        if self._load_failed:
+            # Never overwrite unreadable stored counters with fresh (lower) ones.
+            return False
         try:
-            self.storage.set(self.storage_key, self.export_state())
+            ok = bool(self.storage.set(self.storage_key, self.export_state()))
         except Exception as error:  # noqa: BLE001
             print(f"[GROQ BUDGET] Could not save counters: {type(error).__name__}: {error}")
+            ok = False
+        if not ok and not self._save_failed:
+            print("[GROQ BUDGET] Saving usage counters failed; AI requests are blocked until a save succeeds.")
+        self._save_failed = not ok
+        return ok
 
-    def _refresh(self) -> None:
-        """Pick up counters written by other processes (shared backends only)."""
-        if self.shared:
+    @property
+    def persistence_healthy(self) -> bool:
+        return not (self._load_failed or self._save_failed)
+
+    def _ensure_persistence_ok(self) -> None:
+        """Gate for every new provider request (fail closed).
+
+        Shared backends re-read the counters here (picking up other processes).
+        After a load failure the read is retried; after a save failure the save
+        is retried. Raises :class:`QuotaPersistenceError` while either fails.
+        """
+        if self.storage is None:
+            return
+        if self.shared or self._load_failed:
             self._load_state()
+        if self._load_failed:
+            raise QuotaPersistenceError("load")
+        if self._save_failed and not self._save_state():
+            raise QuotaPersistenceError("save")
 
     def _mutate(self, fn: Callable[[], Any]) -> Any:
         """Apply ``fn`` to the counters and persist them.
 
-        Single-process backends: run ``fn`` then save (the original behaviour).
+        Single-process backends: run ``fn`` then save (the original behaviour);
+        a failed save marks persistence unhealthy, which blocks the next request.
         Shared backends: one atomic ``update`` - load the latest stored
         counters, apply ``fn``, store the result - so concurrent processes never
-        lose each other's increments. If ``fn`` raises, nothing is written.
+        lose each other's increments. If ``fn`` raises, nothing is written and
+        its error propagates; if the storage update itself fails, persistence
+        is marked unhealthy and :class:`QuotaPersistenceError` is raised.
         """
         if not self.shared:
             result = fn()
@@ -740,10 +813,23 @@ class GroqBudgetGovernor:
         def apply(current: dict | None) -> dict:
             if current is not None:
                 self.import_state(current)
-            box["result"] = fn()
+            try:
+                box["result"] = fn()
+            except BaseException as error:
+                box["fn_error"] = error
+                raise
             return self.export_state()
 
-        self.storage.update(self.storage_key, apply)
+        try:
+            self.storage.update(self.storage_key, apply)
+        except BaseException as error:
+            if box.get("fn_error") is error:
+                raise
+            if not self._save_failed:
+                print(f"[GROQ BUDGET] Saving usage counters failed: {type(error).__name__}: {error}")
+            self._save_failed = True
+            raise QuotaPersistenceError("save") from error
+        self._save_failed = False
         return box.get("result")
 
     # -- main entry point -------------------------------------------------
@@ -776,7 +862,7 @@ class GroqBudgetGovernor:
                 f"{ALLOW_ENTERPRISE_ENV}=1)."
             )
 
-        self._refresh()
+        self._ensure_persistence_ok()
         if self.circuit_open():
             raise self._circuit_error()
 
