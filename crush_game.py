@@ -19,6 +19,8 @@ history to guess who likes whom. The rebuilt game follows these rules:
   naming ``&exclude`` and ``&wipe`` is posted in the configured channel.
 * ``&exclude`` / ``&wipe`` work at any time. Excluded members can't be named
   in a pairing and can't play; ``&wipe`` deletes the member's saved answer.
+* The old aicrush data file is never read. It is left untouched unless the
+  bot owner explicitly runs ``&legacydata wipe confirm``.
 * Minimal data: the per-member record is only the member's own saved answer
   (at most :data:`ANSWER_MAX_CHARS` characters) plus the exclusion list.
 * Every result ends with a fixed joke disclaimer, and every play is admitted
@@ -397,8 +399,17 @@ class CrushGame:
         return "\n".join(lines)
 
 
-def purge_legacy_files(paths: Iterable[Any]) -> list[str]:
-    """Delete stored data from the removed history-mining crush feature."""
+def legacy_files_present(paths: Iterable[Any]) -> list[str]:
+    """Which legacy files exist (existence only; their contents are never read)."""
+    return [str(path) for path in paths if path.exists()]
+
+
+def delete_legacy_files(paths: Iterable[Any]) -> list[str]:
+    """Delete data left by the removed history-mining crush feature.
+
+    Only ever called from the owner-run ``&legacydata wipe confirm`` command;
+    nothing deletes it automatically.
+    """
     removed = []
     for path in paths:
         try:

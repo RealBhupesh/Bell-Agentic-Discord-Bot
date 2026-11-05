@@ -15,6 +15,7 @@ Discord moderation bot with prefix commands (default: `&`).
 - `&automod <on|off|toggle|status>` (moderators can control AutoMod per server)
 - `&crushgame <on|off|status> [#channel]` (Manage Server) enables the Crush-o-Meter game and posts a one-time fun-features notice
 - `&exclude` / `&include` opt out of (or back into) fun features; `&wipe` deletes your stored fun-feature data
+- `&legacydata [status|wipe confirm]` (bot owner only) checks for, or permanently deletes, the old aicrush data file; it is never deleted automatically
 - Auto moderation:
   - blocked words from `data/bad_words.txt`
   - link blocking
@@ -348,4 +349,6 @@ Depending on which commands you use:
   `myvibe`) refuse to analyze you. `&include` undoes it. `&wipe` deletes your saved answer.
 - Every result ends with a fixed "just a joke" disclaimer, and every play counts against the
   `crush_game` daily cap in the budget governor.
-- On startup the legacy `data/aicrush_state.json` (and its backup) is deleted.
+- The legacy `data/aicrush_state.json` (and its backup) from the old feature is no longer read
+  or written, and is **not** deleted automatically. The bot owner can check it with
+  `&legacydata status` and delete it with `&legacydata wipe confirm` (owner-only, irreversible).

@@ -338,12 +338,37 @@ def test_old_history_mining_path_is_removed():
         assert gone not in source, gone
 
 
-def test_legacy_aicrush_file_is_purged(tmp_path):
+def test_legacy_aicrush_file_is_not_read_or_deleted_at_startup():
+    source = bot_source()
+    loader = source.split("def load_crush_game_state()", 1)[1].split("\ndef ", 1)[0]
+    assert "LEGACY_AICRUSH" not in loader and "delete_legacy" not in loader
+    # The legacy reader is gone: nothing opens, creates or deletes the file automatically.
+    assert source.count("LEGACY_AICRUSH_STATE_FILE") == 3  # definition + two uses in the owner-only path helper
+    assert "read_json(LEGACY_AICRUSH_STATE_FILE" not in source
+    assert "AICRUSH_STATE_FILE.write_text" not in source
+    assert not hasattr(cg, "purge_legacy_files")
+
+
+def test_legacy_file_is_deleted_only_by_owner_command_with_confirm():
+    source = bot_source()
+    assert source.count("crush_game.delete_legacy_files(") == 1
+    command = source.split('@bot.command(name="legacydata")', 1)[1].split("\n@bot.", 1)[0]
+    assert "@commands.is_owner()" in command
+    assert 'confirm.strip().lower() != "confirm"' in command
+    assert "crush_game.delete_legacy_files(paths)" in command
+
+
+def test_legacy_helpers_never_read_contents(tmp_path):
     legacy = tmp_path / "aicrush_state.json"
-    legacy.write_text('{"guilds": {"1": {"users": {"5": {"samples": ["made-up old text"]}}}}}', encoding="utf-8")
+    legacy.write_text('{"made": "up"}', encoding="utf-8")
     missing = tmp_path / "aicrush_state.json.bak"
-    assert cg.purge_legacy_files([legacy, missing]) == [str(legacy)]
+    assert cg.legacy_files_present([legacy, missing]) == [str(legacy)]
+    assert legacy.exists()  # checking presence leaves it untouched
+    assert cg.delete_legacy_files([legacy, missing]) == [str(legacy)]
     assert not legacy.exists()
+    src = (ROOT / "crush_game.py").read_text(encoding="utf-8")
+    helpers = src[src.index("def legacy_files_present"):]
+    assert "read_text" not in helpers and "open(" not in helpers
 
 
 # -- framing ----------------------------------------------------------------------------
