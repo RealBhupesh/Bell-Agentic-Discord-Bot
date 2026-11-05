@@ -35,6 +35,7 @@ Discord moderation bot with prefix commands (default: `&`).
   - DM the bot with `remove timeout` to remove your active timeout (if bot has permission)
 - AI commands:
   - `&ai <prompt>` or `&ask <prompt>`
+  - `&agent <request>` (tool-using moderation assistant; see "Agent" below)
   - `&aisummary [count]`
   - `&catchup [hours]`
   - `&catchupchannel <#channel> [hours]`
@@ -220,6 +221,10 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `GROQ_BUDGET_MAX_WAIT_SECONDS=20`
 - `GROQ_DEFAULT_RETRY_AFTER_SECONDS=60`
 - `GROQ_QUEUE_MAX=100`
+- `GROQ_BUDGET_STATE_FILE=` (default `data/groq_budget_state.json`)
+- `GROQ_ALLOW_ENTERPRISE_MODELS=0`
+- `AGENT_DAILY_CAP=20`
+- `AGENT_MAX_TOKENS=500`
 - `FFMPEG_PATH=ffmpeg`
 - `MUSIC_MAX_PLAYLIST_ITEMS=50`
 - `SPOTIFY_CLIENT_ID=`
@@ -237,6 +242,29 @@ Every Groq chat completion goes through `groq_budget.py`, which keeps the bot in
   (feature names are the AI `policy_key`s; `GROQ_FEATURE_DAILY_CAP_DEFAULT=0` means unlimited).
 - Automatic fallback to the next model on HTTP 429 or an exhausted budget.
 - When every model is out of budget, AI commands reply "AI budget used up for today" without calling Groq.
+- Usage counters are saved to `GROQ_BUDGET_STATE_FILE` (atomic JSON writes after every change) and
+  loaded on start, so a restart does not reset daily allowances. One bot process per state file is assumed.
+- Default model chains use only free-tier models. Enterprise-tier models (`llama-3.3-70b-versatile`,
+  `llama-3.1-8b-instant`, `moonshotai/kimi-k2-*`) are dropped from every chain, including env-provided ones,
+  unless `GROQ_ALLOW_ENTERPRISE_MODELS=1`.
+
+## Agent
+
+`&agent <request>` runs a plan-act-check loop (`agent_core.py`) over a tool registry (`agent_tools.py`)
+built from existing bot functions. It uses the normal AI completion path (Groq requests go through the
+governor under the `agent` feature), replies only in the channel where it was invoked, and screens its
+output with the bot's blocked-word list and AI-guard heuristics before posting.
+
+- Read-only tools run immediately: `member_info`, `channel_info`, `warn_count`, `modlog_tail`
+  (these two are moderator-only), `xp_lookup`, `economy_lookup`, `search_messages` (the bot's in-memory
+  message buffers, limited to channels the requester can read).
+- Consequential tools never run directly: `warn`, `timeout`, `lock_channel`, `unlock_channel`,
+  `post_message`, `schedule_followup`. Each becomes a card with Confirm / Cancel buttons. Only a member
+  who passes the bot's moderator check (plus the tool's Discord permission, e.g. Moderate Members for
+  `timeout`) can confirm; the requester or any moderator can cancel; cards expire after 10 minutes.
+  Every confirmed execution (and any failure) is written to the mod-log.
+- Limits: at most 5 tool calls per request, 60 seconds overall, `AGENT_DAILY_CAP` requests per user per
+  UTC day (default 20).
 
 Run the tests with `pip install -r requirements-dev.txt && python -m pytest`.
 

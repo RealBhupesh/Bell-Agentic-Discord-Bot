@@ -23,6 +23,8 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+import agent_core
+import agent_tools
 import groq_budget
 
 try:
@@ -186,18 +188,13 @@ AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS = env_int(
     "AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS", 21600, 300
 )
 AICRUSH_STATE_STALE_SECONDS = env_int("AICRUSH_STATE_STALE_SECONDS", 1800, 60)
-AICRUSH_RANK_MODEL = os.getenv("AICRUSH_RANK_MODEL", "openai/gpt-oss-120b").strip()
-AICRUSH_EXPLAIN_MODEL = os.getenv(
-    "AICRUSH_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
-).strip()
-AICRUSH_FALLBACK_MODELS = [
-    model.strip()
-    for model in os.getenv(
-        "AICRUSH_FALLBACK_MODELS",
-        "llama-3.3-70b-versatile,openai/gpt-oss-20b",
-    ).split(",")
-    if model.strip()
-]
+AICRUSH_RANK_MODEL = groq_budget.load_primary_model("AICRUSH_RANK_MODEL", "openai/gpt-oss-120b")
+AICRUSH_EXPLAIN_MODEL = groq_budget.load_primary_model(
+    "AICRUSH_EXPLAIN_MODEL", "openai/gpt-oss-120b"
+)
+AICRUSH_FALLBACK_MODELS = groq_budget.load_model_chain(
+    "AICRUSH_FALLBACK_MODELS", "openai/gpt-oss-20b,qwen/qwen3.8-27b"
+)
 ALTFINDER_STATE_FLUSH_SECONDS = env_int("ALTFINDER_STATE_FLUSH_SECONDS", 30, 10)
 ALTFINDER_BACKFILL_MESSAGE_BUDGET = env_int(
     "ALTFINDER_BACKFILL_MESSAGE_BUDGET", 3200, 200
@@ -214,18 +211,13 @@ ALTFINDER_COMMAND_MAX_BACKFILL_SECONDS = env_float(
 ALTFINDER_CACHE_SECONDS = env_int("ALTFINDER_CACHE_SECONDS", 900, 30)
 ALTFINDER_MAX_RESULTS = env_int("ALTFINDER_MAX_RESULTS", 5, 1)
 ALTFINDER_MAX_SUSPECTS = 3
-ALTFINDER_RANK_MODEL = os.getenv("ALTFINDER_RANK_MODEL", "openai/gpt-oss-120b").strip()
-ALTFINDER_EXPLAIN_MODEL = os.getenv(
+ALTFINDER_RANK_MODEL = groq_budget.load_primary_model("ALTFINDER_RANK_MODEL", "openai/gpt-oss-120b")
+ALTFINDER_EXPLAIN_MODEL = groq_budget.load_primary_model(
     "ALTFINDER_EXPLAIN_MODEL", "openai/gpt-oss-120b"
-).strip()
-ALTFINDER_FALLBACK_MODELS = [
-    model.strip()
-    for model in os.getenv(
-        "ALTFINDER_FALLBACK_MODELS",
-        "moonshotai/kimi-k2-instruct-0905,llama-3.3-70b-versatile,openai/gpt-oss-20b",
-    ).split(",")
-    if model.strip()
-]
+)
+ALTFINDER_FALLBACK_MODELS = groq_budget.load_model_chain(
+    "ALTFINDER_FALLBACK_MODELS", "openai/gpt-oss-20b,qwen/qwen3.8-27b"
+)
 SOCIALINTEL_STATE_FLUSH_SECONDS = env_int("SOCIALINTEL_STATE_FLUSH_SECONDS", 30, 10)
 SOCIALINTEL_BACKFILL_MESSAGE_BUDGET = env_int(
     "SOCIALINTEL_BACKFILL_MESSAGE_BUDGET", 3200, 200
@@ -241,20 +233,15 @@ SOCIALINTEL_COMMAND_MAX_BACKFILL_SECONDS = env_float(
 )
 SOCIALINTEL_CACHE_SECONDS = env_int("SOCIALINTEL_CACHE_SECONDS", 900, 30)
 SOCIALINTEL_MAX_RESULTS = env_int("SOCIALINTEL_MAX_RESULTS", 5, 1)
-SOCIALINTEL_RANK_MODEL = os.getenv(
+SOCIALINTEL_RANK_MODEL = groq_budget.load_primary_model(
     "SOCIALINTEL_RANK_MODEL", "openai/gpt-oss-120b"
-).strip()
-SOCIALINTEL_EXPLAIN_MODEL = os.getenv(
-    "SOCIALINTEL_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
-).strip()
-SOCIALINTEL_FALLBACK_MODELS = [
-    model.strip()
-    for model in os.getenv(
-        "SOCIALINTEL_FALLBACK_MODELS",
-        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-20b,llama-3.3-70b-versatile",
-    ).split(",")
-    if model.strip()
-]
+)
+SOCIALINTEL_EXPLAIN_MODEL = groq_budget.load_primary_model(
+    "SOCIALINTEL_EXPLAIN_MODEL", "openai/gpt-oss-120b"
+)
+SOCIALINTEL_FALLBACK_MODELS = groq_budget.load_model_chain(
+    "SOCIALINTEL_FALLBACK_MODELS", "openai/gpt-oss-20b,qwen/qwen3.8-27b"
+)
 THREADREVIVE_PROACTIVE_ENABLED = env_bool("THREADREVIVE_PROACTIVE_ENABLED", False)
 THREADREVIVE_PROACTIVE_MIN_IDLE_MINUTES = env_int(
     "THREADREVIVE_PROACTIVE_MIN_IDLE_MINUTES", 180, 15
@@ -455,7 +442,13 @@ MODEL_CACHE_TS = 0.0
 MODEL_CACHE_TTL_SECONDS = 600
 AI_REQUEST_SEMAPHORE = asyncio.Semaphore(AI_MAX_INFLIGHT)
 AI_CIRCUIT_OPEN_UNTIL: dict[str, float] = {}
-GROQ_BUDGET = groq_budget.GroqBudgetGovernor.from_env(os.environ)
+GROQ_BUDGET_STATE_FILE = Path(
+    os.getenv("GROQ_BUDGET_STATE_FILE", "").strip() or str(DATA_DIR / "groq_budget_state.json")
+)
+# Usage counters survive restarts; one bot process is assumed to own this file.
+GROQ_BUDGET = groq_budget.GroqBudgetGovernor.from_env(
+    os.environ, state_path=GROQ_BUDGET_STATE_FILE
+)
 AI_MOD_STATE: dict[str, Any] = {}
 AI_MOD_STATE_DIRTY = False
 AI_MOD_STATE_LOCK = asyncio.Lock()
@@ -22660,12 +22653,18 @@ async def unmute_member(
     )
 
 
+async def set_channel_send_locked(
+    channel: discord.abc.GuildChannel, guild: discord.Guild, locked: bool, reason: str
+) -> None:
+    overwrite = channel.overwrites_for(guild.default_role)
+    overwrite.send_messages = False if locked else None
+    await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=reason)
+
+
 @bot.command(name="lock")
 @commands.has_permissions(manage_channels=True)
 async def lock_channel(ctx: commands.Context, *, reason: str = "No reason provided.") -> None:
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = False
-    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=reason)
+    await set_channel_send_locked(ctx.channel, ctx.guild, True, reason)
     await ctx.send(f"Locked {ctx.channel.mention}. Reason: {reason}")
     await send_mod_log(
         ctx.guild,
@@ -22679,9 +22678,7 @@ async def lock_channel(ctx: commands.Context, *, reason: str = "No reason provid
 @bot.command(name="unlock")
 @commands.has_permissions(manage_channels=True)
 async def unlock_channel(ctx: commands.Context, *, reason: str = "No reason provided.") -> None:
-    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = None
-    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=reason)
+    await set_channel_send_locked(ctx.channel, ctx.guild, False, reason)
     await ctx.send(f"Unlocked {ctx.channel.mention}. Reason: {reason}")
     await send_mod_log(
         ctx.guild,
@@ -22709,26 +22706,30 @@ async def slowmode_channel(ctx: commands.Context, seconds: int) -> None:
     )
 
 
-@bot.command(name="warn")
-@commands.has_permissions(manage_messages=True)
-async def warn_member(
-    ctx: commands.Context, member: discord.Member, *, reason: str
-) -> None:
+def add_member_warning(guild_id: int, member_id: int, reason: str, moderator_id: int) -> int:
+    """Record a warning and return the member's new total."""
     warnings = load_warnings()
-    guild_key = str(ctx.guild.id)
-    user_key = str(member.id)
+    guild_key = str(guild_id)
+    user_key = str(member_id)
 
     warnings.setdefault(guild_key, {}).setdefault(user_key, [])
     warnings[guild_key][user_key].append(
         {
             "reason": reason,
-            "moderator_id": ctx.author.id,
+            "moderator_id": moderator_id,
             "timestamp": discord.utils.utcnow().isoformat(),
         }
     )
     save_warnings(warnings)
+    return len(warnings[guild_key][user_key])
 
-    total = len(warnings[guild_key][user_key])
+
+@bot.command(name="warn")
+@commands.has_permissions(manage_messages=True)
+async def warn_member(
+    ctx: commands.Context, member: discord.Member, *, reason: str
+) -> None:
+    total = add_member_warning(ctx.guild.id, member.id, reason, ctx.author.id)
     await ctx.send(f"Warned {member.mention}. Total warnings: `{total}`.")
     await send_mod_log(
         ctx.guild,
@@ -22784,6 +22785,326 @@ async def clear_warnings(ctx: commands.Context, member: discord.Member) -> None:
         return
 
     await ctx.send(f"{member.mention} has no warnings.")
+
+
+# ---------------------------------------------------------------------------
+# Agent (&agent): tool registry over existing bot functions + plan-act-check loop
+# ---------------------------------------------------------------------------
+
+AGENT_LIMITS = agent_core.load_agent_limits(os.environ)
+AGENT_MAX_TOKENS = env_int("AGENT_MAX_TOKENS", 500, 150)
+AGENT_WITHHELD_MESSAGE = "The agent's reply was withheld by this server's safety filter."
+AGENT_BLOCKED_CATEGORIES = {"scam_phishing", "harassment_toxic"}
+AGENT_FOLLOWUP_TASKS: set[asyncio.Task] = set()
+AGENT_NO_MENTIONS = discord.AllowedMentions.none()
+
+
+def screen_agent_text(text: str) -> tuple[str, str | None]:
+    """Run agent output through the bot's existing screening (bad words + AI-guard heuristics).
+
+    Returns ``(text_safe_to_post, problem_or_None)``.
+    """
+    content = str(text or "")
+    if matches_bad_word(content):
+        return AGENT_WITHHELD_MESSAGE, "Text contains a blocked word."
+    normalized, _ = _ai_mod_normalize_hinglish(content)
+    verdict = _ai_mod_heuristic_payload(content, normalized, corroborators={})
+    if verdict.get("category") in AGENT_BLOCKED_CATEGORIES:
+        return AGENT_WITHHELD_MESSAGE, f"Text was flagged as `{verdict.get('category')}`."
+    safe = content.replace("@everyone", "@​everyone").replace("@here", "@​here")
+    return safe, None
+
+
+def _agent_screen_text_args(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> str | None:
+    for name, value in args.items():
+        if not isinstance(value, str):
+            continue
+        if "@everyone" in value or "@here" in value:
+            return f"`{name}` must not contain @everyone/@here."
+        _, problem = screen_agent_text(value)
+        if problem:
+            return f"`{name}` was rejected by the safety filter: {problem}"
+    return None
+
+
+async def _agent_member_info(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    member: discord.Member = args["member"]
+    roles = [role.name for role in reversed(member.roles) if role != ctx.guild.default_role]
+    return {
+        "id": member.id,
+        "name": str(member),
+        "display_name": member.display_name,
+        "bot": member.bot,
+        "joined_at": member.joined_at.isoformat() if member.joined_at else None,
+        "account_created_at": member.created_at.isoformat(),
+        "top_role": member.top_role.name,
+        "roles": roles[:10],
+        "timed_out": has_active_timeout(member),
+        "is_moderator": is_moderator(member),
+    }
+
+
+async def _agent_channel_info(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    channel = args["channel"]
+    overwrite = (
+        channel.overwrites_for(ctx.guild.default_role) if hasattr(channel, "overwrites_for") else None
+    )
+    return {
+        "id": channel.id,
+        "name": channel.name,
+        "type": str(channel.type),
+        "category": channel.category.name if getattr(channel, "category", None) else None,
+        "topic": getattr(channel, "topic", None),
+        "slowmode_seconds": getattr(channel, "slowmode_delay", 0),
+        "locked_for_everyone": bool(overwrite is not None and overwrite.send_messages is False),
+        "nsfw": bool(getattr(channel, "nsfw", False)),
+    }
+
+
+async def _agent_warn_count(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    member: discord.Member = args["member"]
+    entries = load_warnings().get(str(ctx.guild.id), {}).get(str(member.id), [])
+    return {
+        "member_id": member.id,
+        "total": len(entries),
+        "recent": [
+            {"reason": str(e.get("reason", ""))[:200], "timestamp": e.get("timestamp")}
+            for e in entries[-3:]
+            if isinstance(e, dict)
+        ],
+    }
+
+
+async def _agent_modlog_tail(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    channel_id = get_guild_mod_log_channel_id(ctx.guild.id)
+    log_channel = ctx.guild.get_channel(channel_id) if channel_id else None
+    if not isinstance(log_channel, discord.TextChannel):
+        return {"entries": [], "note": "No mod-log channel is configured."}
+    entries: list[dict[str, Any]] = []
+    async for message in log_channel.history(limit=int(args["limit"])):
+        for embed in message.embeds:
+            fields = {field.name: str(field.value)[:200] for field in embed.fields}
+            entries.append({"time": message.created_at.isoformat(), **fields})
+    return {"entries": entries}
+
+
+async def _agent_xp_lookup(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    member: discord.Member = args["member"]
+    snapshot = get_rank_snapshot(ctx.guild.id, member.id)
+    position, total = get_user_rank_position(ctx.guild, member.id, "alltime")
+    return {"member_id": member.id, **snapshot, "alltime_rank": position, "ranked_members": total}
+
+
+async def _agent_economy_lookup(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    member: discord.Member = args["member"]
+    users = get_business_state().get("users", {})
+    row = users.get(str(member.id)) if isinstance(users, dict) else None
+    if not isinstance(row, dict):
+        return {"member_id": member.id, "has_profile": False}
+    return {
+        "member_id": member.id,
+        "has_profile": True,
+        "cash": round(float(row.get("cash", 0.0)), 2),
+        "networth": round(_business_networth(member.id), 2),
+        "credit_score": row.get("credit_score"),
+        "businesses": len(row.get("business_ids", []) or []),
+        "frozen": bool(row.get("frozen", False)),
+    }
+
+
+async def _agent_search_messages(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> dict[str, Any]:
+    """Search the bot's in-memory message windows; never reads channels the requester cannot."""
+    query = str(args["query"]).lower()
+    limit = int(args["limit"])
+    readable: dict[int, bool] = {}
+    seen: set[int] = set()
+    hits: list[WindowMessage] = []
+    for _, window in list(MESSAGE_WINDOW_CACHE.values()):
+        for entry in window:
+            if entry.message_id in seen or query not in entry.content.lower():
+                continue
+            if entry.channel_id not in readable:
+                channel = ctx.guild.get_channel(entry.channel_id)
+                readable[entry.channel_id] = bool(
+                    channel is not None and channel.permissions_for(ctx.author).read_messages
+                )
+            if not readable[entry.channel_id]:
+                continue
+            seen.add(entry.message_id)
+            hits.append(entry)
+    hits.sort(key=lambda entry: entry.created_at_ts, reverse=True)
+    return {
+        "matches": [
+            {
+                "channel_id": entry.channel_id,
+                "author": entry.author_display_name,
+                "author_id": entry.author_id,
+                "content": entry.content[:300],
+                "time": datetime.fromtimestamp(entry.created_at_ts, timezone.utc).isoformat(),
+            }
+            for entry in hits[:limit]
+        ],
+        "note": None if hits else "No matches in the bot's recent message buffers.",
+    }
+
+
+async def _agent_do_warn(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> str:
+    member: discord.Member = args["member"]
+    total = add_member_warning(ctx.guild.id, member.id, args["reason"], ctx.actor.id)
+    return f"Warned {member.mention}. Total warnings: {total}."
+
+
+async def _agent_do_timeout(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> str:
+    member: discord.Member = args["member"]
+    minutes = int(args["minutes"])
+    until = discord.utils.utcnow() + timedelta(minutes=minutes)
+    await member.timeout(until, reason=f"{args['reason']} (agent action confirmed by {ctx.actor})")
+    return f"Timed out {member.mention} for {minutes} minute(s)."
+
+
+async def _agent_do_lock(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> str:
+    channel = args["channel"]
+    await set_channel_send_locked(channel, ctx.guild, True, args["reason"])
+    return f"Locked {channel.mention}."
+
+
+async def _agent_do_unlock(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> str:
+    channel = args["channel"]
+    await set_channel_send_locked(channel, ctx.guild, False, args["reason"])
+    return f"Unlocked {channel.mention}."
+
+
+async def _agent_do_post_message(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> str:
+    channel = args["channel"]
+    if not channel.permissions_for(ctx.actor).send_messages:
+        raise agent_tools.ToolError(f"You cannot send messages in {channel.mention}.")
+    text, problem = screen_agent_text(args["text"])
+    if problem:
+        raise agent_tools.ToolError(problem)
+    await channel.send(text, allowed_mentions=AGENT_NO_MENTIONS)
+    return f"Posted a message in {channel.mention}."
+
+
+async def _agent_do_schedule_followup(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> str:
+    minutes = int(args["minutes"])
+    text, problem = screen_agent_text(args["text"])
+    if problem:
+        raise agent_tools.ToolError(problem)
+    channel = ctx.channel  # follow-ups go only to the channel where &agent was invoked
+
+    async def fire_followup() -> None:
+        await asyncio.sleep(minutes * 60)
+        try:
+            await channel.send(f"Follow-up: {text}", allowed_mentions=AGENT_NO_MENTIONS)
+        except discord.HTTPException:
+            pass
+
+    task = asyncio.create_task(fire_followup())
+    AGENT_FOLLOWUP_TASKS.add(task)
+    task.add_done_callback(AGENT_FOLLOWUP_TASKS.discard)
+    return f"Follow-up scheduled in {channel.mention} in {minutes} minute(s)."
+
+
+def build_agent_registry() -> agent_tools.ToolRegistry:
+    A = agent_tools.ArgSpec
+    T = agent_tools.AgentTool
+    RO, CQ = agent_tools.READ_ONLY, agent_tools.CONSEQUENTIAL
+    member_arg = A("member", "member", "Member mention or ID.")
+    channel_opt = A("channel", "channel", "Channel mention or ID (defaults to the current channel).", required=False)
+    reason_arg = A("reason", "str", "Reason recorded in the mod-log.", max_length=300)
+    registry = agent_tools.ToolRegistry(is_moderator=is_moderator)
+    for tool in (
+        T("member_info", "Look up a member's profile, roles and timeout state.", (member_arg,), RO, _agent_member_info),
+        T("channel_info", "Look up a channel's topic, slowmode and lock state.", (channel_opt,), RO, _agent_channel_info),
+        T("warn_count", "Count a member's warnings and show the latest reasons.", (member_arg,), RO,
+          _agent_warn_count, requires_moderator=True),
+        T("modlog_tail", "Read the most recent mod-log entries.",
+          (A("limit", "int", "How many log messages to read.", required=False, default=5, minimum=1, maximum=10),),
+          RO, _agent_modlog_tail, requires_moderator=True),
+        T("xp_lookup", "Read a member's XP, streak and rank.", (member_arg,), RO, _agent_xp_lookup),
+        T("economy_lookup", "Read a member's economy profile (cash, net worth).", (member_arg,), RO, _agent_economy_lookup),
+        T("search_messages", "Search the bot's recent in-memory message buffers for text.",
+          (A("query", "str", "Case-insensitive text to find.", max_length=100),
+           A("limit", "int", "Max matches.", required=False, default=5, minimum=1, maximum=10)),
+          RO, _agent_search_messages),
+        T("warn", "Warn a member (needs moderator confirmation).", (member_arg, reason_arg), CQ, _agent_do_warn,
+          required_permission="manage_messages", modlog_action="Warn", validate=_agent_screen_text_args),
+        T("timeout", "Time out a member (needs moderator confirmation).",
+          (member_arg, A("minutes", "int", "Timeout length in minutes.", minimum=1, maximum=40320), reason_arg),
+          CQ, _agent_do_timeout, required_permission="moderate_members", modlog_action="Mute",
+          validate=_agent_screen_text_args),
+        T("lock_channel", "Stop @everyone from sending messages in a channel (needs confirmation).",
+          (channel_opt, reason_arg), CQ, _agent_do_lock, required_permission="manage_channels",
+          modlog_action="Lock Channel", validate=_agent_screen_text_args),
+        T("unlock_channel", "Re-allow @everyone to send messages in a channel (needs confirmation).",
+          (channel_opt, reason_arg), CQ, _agent_do_unlock, required_permission="manage_channels",
+          modlog_action="Unlock Channel", validate=_agent_screen_text_args),
+        T("post_message", "Post a message as the bot (needs confirmation).",
+          (A("text", "str", "Message text.", max_length=1500), channel_opt), CQ, _agent_do_post_message,
+          modlog_action="Post Message", validate=_agent_screen_text_args),
+        T("schedule_followup", "Post a follow-up note in this channel after a delay (needs confirmation).",
+          (A("minutes", "int", "Delay in minutes.", minimum=1, maximum=1440),
+           A("text", "str", "Follow-up text.", max_length=500)),
+          CQ, _agent_do_schedule_followup, modlog_action="Schedule Follow-up", validate=_agent_screen_text_args),
+    ):
+        registry.register(tool)
+    return registry
+
+
+async def _agent_complete(messages: list[dict[str, str]]) -> str:
+    # Existing governor-routed completion path (Groq goes through GROQ_BUDGET).
+    return await request_ai_completion(
+        messages,
+        max_tokens=AGENT_MAX_TOKENS,
+        temperature=0.2,
+        policy_key="agent",
+        include_fallback_notice=False,
+    )
+
+
+AGENT_REGISTRY = build_agent_registry()
+AGENT_PENDING = agent_tools.PendingActionManager(is_moderator=is_moderator, mod_log=send_mod_log)
+AGENT_RUNNER = agent_core.AgentRunner(
+    registry=AGENT_REGISTRY,
+    pending=AGENT_PENDING,
+    complete=_agent_complete,
+    limits=AGENT_LIMITS,
+)
+
+
+@bot.command(name="agent")
+@commands.guild_only()
+@commands.cooldown(2, 20, commands.BucketType.user)
+async def agent_command(ctx: commands.Context, *, request: str | None = None) -> None:
+    if not is_ai_configured():
+        await ctx.channel.send(ai_setup_message())
+        return
+    request = (request or "").strip()
+    if not request:
+        await ctx.channel.send(f"Usage: `{PREFIX}agent <what you need>`")
+        return
+    if len(request) > 1500:
+        await ctx.channel.send("Agent requests must be under `1500` characters.")
+        return
+
+    agent_ctx = agent_tools.AgentContext(guild=ctx.guild, channel=ctx.channel, author=ctx.author)
+    async with ctx.typing():
+        result = await AGENT_RUNNER.run(request, agent_ctx)
+
+    reply, _ = screen_agent_text(result.reply)
+    for chunk in split_message(reply):
+        await ctx.channel.send(chunk, allowed_mentions=AGENT_NO_MENTIONS)
+
+    for action in result.pending_actions:
+        if action.status != agent_tools.PENDING:
+            continue
+        card, problem = screen_agent_text(agent_tools.render_card(action))
+        if problem:
+            AGENT_PENDING.expire(action.id)
+            await ctx.channel.send(f"Agent action #{action.id} was withheld by the safety filter.")
+            continue
+        view = agent_tools.build_pending_action_view(AGENT_PENDING, action)
+        view.message = await ctx.channel.send(card, view=view, allowed_mentions=AGENT_NO_MENTIONS)
 
 
 @bot.event
