@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 import agent_core
 import agent_tools
 import agentic_automation
+import crush_game
 import groq_budget
 
 try:
@@ -168,33 +169,12 @@ if _AICRUSH_MAX_CHANNELS_RAW.isdigit():
     AICRUSH_MAX_CHANNELS = max(0, int(_AICRUSH_MAX_CHANNELS_RAW))
 else:
     AICRUSH_MAX_CHANNELS = 0
-AICRUSH_MAX_CONTEXT_CHARS = env_int("AICRUSH_MAX_CONTEXT_CHARS", 16000, 3000)
 AICRUSH_MAX_HISTORY_MESSAGES = env_int("AICRUSH_MAX_HISTORY_MESSAGES", 12000, 500)
 AICRUSH_SCAN_PAUSE_EVERY = env_int("AICRUSH_SCAN_PAUSE_EVERY", 260, 50)
 AICRUSH_SCAN_PAUSE_SECONDS = env_float("AICRUSH_SCAN_PAUSE_SECONDS", 0.12, 0.0)
 AICRUSH_CACHE_SECONDS = env_int("AICRUSH_CACHE_SECONDS", 900, 30)
-AICRUSH_MATCH_COOLDOWN_HOURS = env_int("AICRUSH_MATCH_COOLDOWN_HOURS", 24, 1)
-AICRUSH_STATE_FLUSH_SECONDS = env_int("AICRUSH_STATE_FLUSH_SECONDS", 30, 10)
-AICRUSH_BACKFILL_MESSAGE_BUDGET = env_int("AICRUSH_BACKFILL_MESSAGE_BUDGET", 3500, 200)
-AICRUSH_BACKFILL_TIME_BUDGET_SECONDS = env_float(
-    "AICRUSH_BACKFILL_TIME_BUDGET_SECONDS", 10.0, 1.0
-)
-AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES = env_int(
-    "AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES", 14000, 1000
-)
-AICRUSH_COMMAND_MAX_BACKFILL_SECONDS = env_float(
-    "AICRUSH_COMMAND_MAX_BACKFILL_SECONDS", 32.0, 5.0
-)
 AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS = env_int(
     "AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS", 21600, 300
-)
-AICRUSH_STATE_STALE_SECONDS = env_int("AICRUSH_STATE_STALE_SECONDS", 1800, 60)
-AICRUSH_RANK_MODEL = groq_budget.load_primary_model("AICRUSH_RANK_MODEL", "openai/gpt-oss-120b")
-AICRUSH_EXPLAIN_MODEL = groq_budget.load_primary_model(
-    "AICRUSH_EXPLAIN_MODEL", "openai/gpt-oss-120b"
-)
-AICRUSH_FALLBACK_MODELS = groq_budget.load_model_chain(
-    "AICRUSH_FALLBACK_MODELS", "openai/gpt-oss-20b,qwen/qwen3.8-27b"
 )
 ALTFINDER_STATE_FLUSH_SECONDS = env_int("ALTFINDER_STATE_FLUSH_SECONDS", 30, 10)
 ALTFINDER_BACKFILL_MESSAGE_BUDGET = env_int(
@@ -339,27 +319,6 @@ BUSINESS_CAPITAL_GAINS_SHORT_RATE = env_float("BUSINESS_CAPITAL_GAINS_SHORT_RATE
 BUSINESS_CAPITAL_GAINS_LONG_RATE = env_float("BUSINESS_CAPITAL_GAINS_LONG_RATE", 0.10, 0.0)
 BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS = env_int("BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS", 7, 1)
 BUSINESS_INCOME_TAX_ENABLED = env_bool("BUSINESS_INCOME_TAX_ENABLED", True)
-MALE_ROLE_IDS = {
-    int(raw.strip())
-    for raw in os.getenv("MALE_ROLE_IDS", "").split(",")
-    if raw.strip().isdigit()
-}
-FEMALE_ROLE_IDS = {
-    int(raw.strip())
-    for raw in os.getenv("FEMALE_ROLE_IDS", "").split(",")
-    if raw.strip().isdigit()
-}
-EXTRA_MALE_ROLE_HINTS = {
-    item.strip().lower()
-    for item in os.getenv("MALE_ROLE_HINTS", "").split(",")
-    if item.strip()
-}
-EXTRA_FEMALE_ROLE_HINTS = {
-    item.strip().lower()
-    for item in os.getenv("FEMALE_ROLE_HINTS", "").split(",")
-    if item.strip()
-}
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -377,7 +336,9 @@ CAPABILITIES_CATALOG_FILE = DATA_DIR / "capabilities_catalog.json"
 BAD_WORDS_FILE = DATA_DIR / "bad_words.txt"
 ENGAGEMENT_STATE_FILE = DATA_DIR / "engagement_state.json"
 BUSINESS_STATE_FILE = DATA_DIR / "business_state.json"
-AICRUSH_STATE_FILE = DATA_DIR / "aicrush_state.json"
+# Legacy data from the removed history-mining aicrush feature; deleted at startup.
+LEGACY_AICRUSH_STATE_FILE = DATA_DIR / "aicrush_state.json"
+CRUSH_GAME_STATE_FILE = DATA_DIR / "crush_game.json"
 ALTFINDER_STATE_FILE = DATA_DIR / "altfinder_state.json"
 SOCIALINTEL_STATE_FILE = DATA_DIR / "socialintel_state.json"
 PERSISTENCE_ERROR_LAST_TS: dict[str, float] = {}
@@ -562,7 +523,7 @@ CAPABILITY_QUERY_DOMAIN_TERMS: dict[str, set[str]] = {
     "ai": {"ai", "assistant", "model", "summary", "psych", "argument", "debate", "translate", "translation", "hinglish"},
     "business": {"business", "economy", "market", "stock", "loan", "tax", "portfolio", "networth"},
     "utility": {"utility", "avatar", "userinfo", "serverinfo", "poll", "remind", "snipe"},
-    "fun": {"fun", "roast", "aicrush", "vibe", "futureme", "rizz", "serverlore"},
+    "fun": {"fun", "roast", "crush", "vibe", "futureme", "rizz", "serverlore"},
     "music": {"music", "play", "queue", "join", "leave", "skip", "pause", "resume", "spotify", "youtube"},
     "engagement": {"xp", "rank", "leaderboard", "streak", "daily", "quests", "event", "catchup", "insights"},
 }
@@ -742,12 +703,6 @@ MUSIC_NOW_PLAYING: dict[int, MusicTrack] = {}
 MUSIC_TEXT_CHANNELS: dict[int, int] = {}
 MUSIC_LOCKS: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 APP_COMMANDS_SYNCED = False
-AICRUSH_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
-AICRUSH_RESULT_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
-AICRUSH_ALIAS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
-AICRUSH_CHANNEL_RECENT_AUTHORS: dict[tuple[int, int], deque[tuple[float, int]]] = defaultdict(
-    lambda: deque(maxlen=80)
-)
 AICRUSH_MESSAGE_AUTHOR_CACHE: dict[int, tuple[int, float]] = {}
 ALTFINDER_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
 ALTFINDER_RESULT_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
@@ -772,7 +727,6 @@ MESSAGE_WINDOW_LOCKS: dict[tuple, asyncio.Lock] = defaultdict(asyncio.Lock)
 MESSAGE_WINDOW_CACHE_MAX_ENTRIES = 90
 FUN_USER_RATE_CACHE: dict[tuple[int, int], deque[float]] = defaultdict(lambda: deque(maxlen=40))
 FUN_CHANNEL_RATE_CACHE: dict[tuple[int, int], deque[float]] = defaultdict(lambda: deque(maxlen=60))
-AICRUSH_LAST_MATCHES: dict[tuple[int, int], tuple[int, float]] = {}
 ROAST_RECENT_OUTPUTS: dict[tuple[int, int, str], deque[tuple[float, str]]] = defaultdict(
     lambda: deque(maxlen=8)
 )
@@ -781,9 +735,6 @@ WELCOME_ONBOARDING_SESSIONS: dict[tuple[int, int], dict[str, object]] = {}
 ENGAGEMENT_STATE: dict[str, object] = {"guilds": {}}
 ENGAGEMENT_STATE_DIRTY = False
 ENGAGEMENT_STATE_LOCK = asyncio.Lock()
-AICRUSH_STATE: dict[str, Any] = {}
-AICRUSH_STATE_DIRTY = False
-AICRUSH_STATE_LOCK = asyncio.Lock()
 ALTFINDER_STATE: dict[str, Any] = {}
 ALTFINDER_STATE_DIRTY = False
 ALTFINDER_STATE_LOCK = asyncio.Lock()
@@ -1176,8 +1127,6 @@ def ensure_data_files() -> None:
         ENGAGEMENT_STATE_FILE.write_text('{"guilds": {}}', encoding="utf-8")
     if not BUSINESS_STATE_FILE.exists():
         BUSINESS_STATE_FILE.write_text("{}", encoding="utf-8")
-    if not AICRUSH_STATE_FILE.exists():
-        AICRUSH_STATE_FILE.write_text('{"schema_version": 1, "guilds": {}}', encoding="utf-8")
     if not ALTFINDER_STATE_FILE.exists():
         ALTFINDER_STATE_FILE.write_text('{"schema_version": 1, "guilds": {}}', encoding="utf-8")
     if not SOCIALINTEL_STATE_FILE.exists():
@@ -3033,51 +2982,6 @@ def set_guild_business_tax_overrides(guild_id: int, payload: dict[str, float]) -
     save_mod_config(config)
 
 
-def parse_role_id_list(raw_values: object) -> set[int]:
-    parsed: set[int] = set()
-    if isinstance(raw_values, list):
-        for raw in raw_values:
-            if isinstance(raw, int):
-                parsed.add(raw)
-            elif isinstance(raw, str) and raw.isdigit():
-                parsed.add(int(raw))
-    elif isinstance(raw_values, str):
-        for item in raw_values.split(","):
-            cleaned = item.strip()
-            if cleaned.isdigit():
-                parsed.add(int(cleaned))
-    return parsed
-
-
-def get_guild_gender_role_ids(guild_id: int) -> tuple[set[int], set[int]]:
-    config = load_mod_config()
-    guild_config = config.get(str(guild_id), {})
-    guild_male = parse_role_id_list(guild_config.get("male_role_ids"))
-    guild_female = parse_role_id_list(guild_config.get("female_role_ids"))
-    if guild_male or guild_female:
-        return guild_male, guild_female
-    return set(MALE_ROLE_IDS), set(FEMALE_ROLE_IDS)
-
-
-def set_guild_gender_role_ids(guild_id: int, male_role_ids: list[int], female_role_ids: list[int]) -> None:
-    config = load_mod_config()
-    guild_key = str(guild_id)
-    config.setdefault(guild_key, {})
-    config[guild_key]["male_role_ids"] = sorted(set(male_role_ids))
-    config[guild_key]["female_role_ids"] = sorted(set(female_role_ids))
-    save_mod_config(config)
-
-
-def clear_guild_gender_role_ids(guild_id: int) -> None:
-    config = load_mod_config()
-    guild_key = str(guild_id)
-    if guild_key not in config:
-        return
-    config[guild_key].pop("male_role_ids", None)
-    config[guild_key].pop("female_role_ids", None)
-    save_mod_config(config)
-
-
 def matches_bad_word(content: str) -> str | None:
     if not BAD_WORDS:
         return None
@@ -3460,91 +3364,6 @@ async def flush_engagement_state(force: bool = False) -> None:
                 ENGAGEMENT_STATE_DIRTY = False
         except Exception:
             pass
-
-
-def _default_aicrush_state() -> dict[str, Any]:
-    return {"schema_version": 1, "guilds": {}}
-
-
-def _sanitize_aicrush_state(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        payload = {}
-    guilds = payload.get("guilds")
-    if not isinstance(guilds, dict):
-        guilds = {}
-    sanitized: dict[str, Any] = {"schema_version": 1, "guilds": {}}
-    for guild_key, raw_guild in guilds.items():
-        if not isinstance(raw_guild, dict):
-            continue
-        clean_guild = {
-            "channels": raw_guild.get("channels", {}) if isinstance(raw_guild.get("channels"), dict) else {},
-            "users": raw_guild.get("users", {}) if isinstance(raw_guild.get("users"), dict) else {},
-            "edges": raw_guild.get("edges", {}) if isinstance(raw_guild.get("edges"), dict) else {},
-            "meta": raw_guild.get("meta", {}) if isinstance(raw_guild.get("meta"), dict) else {},
-        }
-        sanitized["guilds"][str(guild_key)] = clean_guild
-    return sanitized
-
-
-def load_aicrush_state() -> None:
-    global AICRUSH_STATE, AICRUSH_STATE_DIRTY
-    payload = read_json(AICRUSH_STATE_FILE)
-    if not payload:
-        payload = _default_aicrush_state()
-    AICRUSH_STATE = _sanitize_aicrush_state(payload)
-    AICRUSH_STATE_DIRTY = False
-
-
-def get_aicrush_state() -> dict[str, Any]:
-    global AICRUSH_STATE
-    if not AICRUSH_STATE:
-        AICRUSH_STATE = _default_aicrush_state()
-        _mark_aicrush_dirty()
-    AICRUSH_STATE = _sanitize_aicrush_state(AICRUSH_STATE)
-    return AICRUSH_STATE
-
-
-def _mark_aicrush_dirty() -> None:
-    global AICRUSH_STATE_DIRTY
-    AICRUSH_STATE_DIRTY = True
-
-
-async def flush_aicrush_state(force: bool = False) -> None:
-    global AICRUSH_STATE_DIRTY
-    if not force and not AICRUSH_STATE_DIRTY:
-        return
-    async with AICRUSH_STATE_LOCK:
-        if not force and not AICRUSH_STATE_DIRTY:
-            return
-        try:
-            persisted = write_json(AICRUSH_STATE_FILE, AICRUSH_STATE)
-            if persisted:
-                AICRUSH_STATE_DIRTY = False
-        except Exception:
-            pass
-
-
-def get_guild_aicrush_state(guild_id: int) -> dict[str, Any]:
-    state = get_aicrush_state()
-    guilds = state.setdefault("guilds", {})
-    if not isinstance(guilds, dict):
-        guilds = {}
-        state["guilds"] = guilds
-    key = str(guild_id)
-    guild_state = guilds.get(key)
-    if not isinstance(guild_state, dict):
-        guild_state = {"channels": {}, "users": {}, "edges": {}, "meta": {}}
-        guilds[key] = guild_state
-        _mark_aicrush_dirty()
-    for field in ("channels", "users", "edges", "meta"):
-        if not isinstance(guild_state.get(field), dict):
-            guild_state[field] = {}
-    meta = guild_state["meta"]
-    meta.setdefault("messages_indexed", 0)
-    meta.setdefault("last_backfill_ts", 0.0)
-    meta.setdefault("last_incremental_ts", 0.0)
-    meta.setdefault("last_indexed_message_ts", 0.0)
-    return guild_state
 
 
 def _default_altfinder_state() -> dict[str, Any]:
@@ -4266,122 +4085,6 @@ async def release_expired_heat_slowmodes() -> None:
         except discord.HTTPException:
             pass
         CHANNEL_HEAT_SLOWMODE_STATE.pop((guild_id, channel_id), None)
-
-
-MALE_ROLE_HINTS = {
-    "male",
-    "man",
-    "boy",
-    "he/him",
-    "he him",
-    "hehim",
-    "gentleman",
-    "king",
-    "men",
-    "masc",
-    "masculine",
-    "guy",
-    "guys",
-    "bro",
-    "bros",
-    "prince",
-    "mr",
-    "sir",
-    "him",
-}
-FEMALE_ROLE_HINTS = {
-    "female",
-    "woman",
-    "girl",
-    "she/her",
-    "she her",
-    "sheher",
-    "lady",
-    "queen",
-    "women",
-    "fem",
-    "femme",
-    "feminine",
-    "princess",
-    "miss",
-    "ms",
-    "madam",
-    "her",
-    "sis",
-    "girlie",
-    "girly",
-}
-
-
-def normalize_role_name_for_gender(name: str) -> str:
-    lowered = name.lower().strip()
-    normalized = unicodedata.normalize("NFKD", lowered)
-    without_marks = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    cleaned = re.sub(r"[^a-z0-9/+\s]", " ", without_marks)
-    compact = re.sub(r"\s+", " ", cleaned).strip()
-    return compact
-
-
-def hint_present_in_role_name(role_name: str, hint: str) -> bool:
-    normalized_hint = normalize_role_name_for_gender(hint)
-    if not normalized_hint:
-        return False
-    if " " in normalized_hint or "/" in normalized_hint:
-        return normalized_hint in role_name
-    tokens = set(role_name.split())
-    return normalized_hint in tokens
-
-
-def role_gender_hint(role: discord.Role, guild_id: int) -> str | None:
-    guild_male_ids, guild_female_ids = get_guild_gender_role_ids(guild_id)
-    if role.id in guild_male_ids:
-        return "male"
-    if role.id in guild_female_ids:
-        return "female"
-
-    role_name_raw = role.name.lower().strip()
-    role_name = normalize_role_name_for_gender(role.name)
-
-    female_symbols = ("â™€", "ðŸšº", "ðŸ‘§", "ðŸ‘©", "ðŸ©·", "ðŸŽ€", "ðŸ’–")
-    male_symbols = ("â™‚", "ðŸš¹", "ðŸ‘¦", "ðŸ‘¨", "ðŸ’™")
-
-    if any(sym in role_name_raw for sym in female_symbols):
-        return "female"
-    if any(sym in role_name_raw for sym in male_symbols):
-        return "male"
-
-    female_hints = FEMALE_ROLE_HINTS | EXTRA_FEMALE_ROLE_HINTS
-    male_hints = MALE_ROLE_HINTS | EXTRA_MALE_ROLE_HINTS
-
-    female_hit = any(hint_present_in_role_name(role_name, hint) for hint in female_hints)
-    male_hit = any(hint_present_in_role_name(role_name, hint) for hint in male_hints)
-    if female_hit and not male_hit:
-        return "female"
-    if male_hit and not female_hit:
-        return "male"
-    return None
-
-
-def detect_member_gender_from_roles(member: discord.Member) -> str | None:
-    guild_male_ids, guild_female_ids = get_guild_gender_role_ids(member.guild.id)
-    has_male_id = any(role.id in guild_male_ids for role in member.roles)
-    has_female_id = any(role.id in guild_female_ids for role in member.roles)
-    if has_male_id and not has_female_id:
-        return "male"
-    if has_female_id and not has_male_id:
-        return "female"
-    if has_male_id and has_female_id:
-        return None
-
-    sorted_roles = sorted(member.roles, key=lambda role: role.position, reverse=True)
-    guild_id = member.guild.id
-    for role in sorted_roles:
-        if role.is_default():
-            continue
-        hint = role_gender_hint(role, guild_id)
-        if hint is not None:
-            return hint
-    return None
 
 
 def append_with_char_budget(bucket: list[str], text: str, current_chars: int, max_chars: int) -> int:
@@ -5168,8 +4871,9 @@ async def handle_welcome_concierge_dm(message: discord.Message) -> bool:
     return True
 
 
-# AICrush implementation lives below. It maintains a persisted directed-affinity
-# index and ranks both likely crushes and likely admirers from that graph.
+# Small text helpers originally written for the old aicrush index. The
+# history-mining crush feature is gone (see crush_game.py); roast, vibe and
+# translation still use these helpers.
 
 
 AICRUSH_ALIAS_STOP_WORDS = {
@@ -5198,64 +4902,6 @@ def _aicrush_is_valid_alias_token(token: str) -> bool:
     return token not in AICRUSH_ALIAS_STOP_WORDS
 
 
-def _build_member_aicrush_aliases(member: discord.Member) -> dict[str, list[str]]:
-    phrases: set[str] = set()
-    tokens: set[str] = set()
-    raw_names = [member.display_name, member.name]
-    for raw_name in raw_names:
-        normalized = normalize_aicrush_text(raw_name)
-        if not normalized:
-            continue
-        if len(normalized) >= 3 and normalized not in AICRUSH_ALIAS_STOP_WORDS:
-            phrases.add(normalized)
-        parts = [part for part in normalized.split() if _aicrush_is_valid_alias_token(part)]
-        tokens.update(parts)
-        if len(parts) >= 2:
-            merged = "".join(parts)
-            if len(merged) >= 4 and merged not in AICRUSH_ALIAS_STOP_WORDS:
-                phrases.add(merged)
-    return {"phrases": sorted(phrases), "tokens": sorted(tokens)}
-
-
-def get_guild_aicrush_alias_index(guild: discord.Guild) -> dict[str, Any]:
-    cached = AICRUSH_ALIAS_CACHE.get(guild.id)
-    now = time.monotonic()
-    if cached and now - cached[0] < 900:
-        return cached[1]
-
-    token_map: dict[str, set[int]] = defaultdict(set)
-    phrase_map: dict[str, set[int]] = defaultdict(set)
-    member_aliases: dict[int, dict[str, list[str]]] = {}
-    for member in guild.members:
-        if member.bot:
-            continue
-        aliases = _build_member_aicrush_aliases(member)
-        member_aliases[member.id] = aliases
-        for token in aliases["tokens"]:
-            token_map[token].add(member.id)
-        for phrase in aliases["phrases"]:
-            phrase_map[phrase].add(member.id)
-
-    index = {
-        "token_map": {token: sorted(ids) for token, ids in token_map.items()},
-        "phrase_map": {phrase: sorted(ids) for phrase, ids in phrase_map.items()},
-        "member_aliases": member_aliases,
-    }
-    AICRUSH_ALIAS_CACHE[guild.id] = (now, index)
-    return index
-
-
-def _aicrush_trim_counter_map(counter_map: dict[str, Any], limit: int) -> dict[str, Any]:
-    if len(counter_map) <= limit:
-        return counter_map
-    ordered = sorted(
-        counter_map.items(),
-        key=lambda item: float(item[1] or 0),
-        reverse=True,
-    )[:limit]
-    return {str(key): value for key, value in ordered}
-
-
 def _aicrush_append_unique_sample(bucket: list[str], text: str, limit: int) -> None:
     cleaned = " ".join(text.split()).strip()[:180]
     if not cleaned or cleaned in bucket:
@@ -5282,1138 +4928,6 @@ def _aicrush_resolve_reply_target_id(message: discord.Message) -> int | None:
     if cached is not None:
         return int(cached[0])
     return None
-
-
-def _aicrush_get_user_row(guild_state: dict[str, Any], member: discord.Member) -> dict[str, Any]:
-    users = guild_state.setdefault("users", {})
-    key = str(member.id)
-    row = users.get(key)
-    if not isinstance(row, dict):
-        row = {
-            "display_name": member.display_name,
-            "username": member.name,
-            "message_count": 0,
-            "last_message_ts": 0.0,
-            "topics": {},
-            "samples": [],
-            "aliases": {},
-        }
-        users[key] = row
-    row["display_name"] = member.display_name
-    row["username"] = member.name
-    if not isinstance(row.get("topics"), dict):
-        row["topics"] = {}
-    if not isinstance(row.get("samples"), list):
-        row["samples"] = []
-    row["aliases"] = _build_member_aicrush_aliases(member)
-    return row
-
-
-def _aicrush_update_user_profile(
-    guild_state: dict[str, Any],
-    member: discord.Member,
-    content: str,
-    created_ts: float,
-) -> None:
-    row = _aicrush_get_user_row(guild_state, member)
-    row["message_count"] = int(row.get("message_count", 0) or 0) + 1
-    row["last_message_ts"] = max(float(row.get("last_message_ts", 0.0) or 0.0), created_ts)
-    topics = row.get("topics", {})
-    if not isinstance(topics, dict):
-        topics = {}
-        row["topics"] = topics
-    for token in aicrush_tokenize(content)[:18]:
-        if not _aicrush_is_valid_alias_token(token):
-            continue
-        topics[token] = int(topics.get(token, 0) or 0) + 1
-    row["topics"] = _aicrush_trim_counter_map(topics, 32)
-    samples = row.get("samples", [])
-    if not isinstance(samples, list):
-        samples = []
-        row["samples"] = samples
-    _aicrush_append_unique_sample(samples, content, 10)
-
-
-def _aicrush_get_edge_row(
-    guild_state: dict[str, Any], source_id: int, target_id: int
-) -> dict[str, Any]:
-    edges = guild_state.setdefault("edges", {})
-    source_key = str(source_id)
-    source_edges = edges.get(source_key)
-    if not isinstance(source_edges, dict):
-        source_edges = {}
-        edges[source_key] = source_edges
-    target_key = str(target_id)
-    row = source_edges.get(target_key)
-    if not isinstance(row, dict):
-        row = {
-            "score": 0.0,
-            "mention_count": 0,
-            "reply_count": 0,
-            "name_hit_score": 0.0,
-            "copresence_score": 0.0,
-            "touch_count": 0,
-            "last_ts": 0.0,
-            "channels": {},
-            "samples": [],
-        }
-        source_edges[target_key] = row
-    if not isinstance(row.get("channels"), dict):
-        row["channels"] = {}
-    if not isinstance(row.get("samples"), list):
-        row["samples"] = []
-    return row
-
-
-def _aicrush_update_edge(
-    guild_state: dict[str, Any],
-    source_id: int,
-    target_id: int,
-    *,
-    score: float,
-    kind: str,
-    created_ts: float,
-    channel_id: int,
-    sample_text: str,
-) -> None:
-    if source_id == target_id or score <= 0:
-        return
-    row = _aicrush_get_edge_row(guild_state, source_id, target_id)
-    row["score"] = round(float(row.get("score", 0.0) or 0.0) + score, 4)
-    row["touch_count"] = int(row.get("touch_count", 0) or 0) + 1
-    row["last_ts"] = max(float(row.get("last_ts", 0.0) or 0.0), created_ts)
-    channels = row.get("channels", {})
-    channel_key = str(channel_id)
-    channels[channel_key] = int(channels.get(channel_key, 0) or 0) + 1
-    row["channels"] = _aicrush_trim_counter_map(channels, 8)
-    if kind == "mention":
-        row["mention_count"] = int(row.get("mention_count", 0) or 0) + 1
-    elif kind == "reply":
-        row["reply_count"] = int(row.get("reply_count", 0) or 0) + 1
-    elif kind == "name_hit":
-        row["name_hit_score"] = round(float(row.get("name_hit_score", 0.0) or 0.0) + score, 4)
-    elif kind == "copresence":
-        row["copresence_score"] = round(float(row.get("copresence_score", 0.0) or 0.0) + score, 4)
-    samples = row.get("samples", [])
-    if not isinstance(samples, list):
-        samples = []
-        row["samples"] = samples
-    _aicrush_append_unique_sample(samples, sample_text, 6)
-
-
-def _aicrush_extract_name_hit_targets(
-    guild: discord.Guild,
-    author_id: int,
-    content: str,
-    *,
-    direct_target_ids: set[int],
-) -> dict[int, float]:
-    if not content:
-        return {}
-    alias_index = get_guild_aicrush_alias_index(guild)
-    token_map = alias_index.get("token_map", {})
-    phrase_map = alias_index.get("phrase_map", {})
-    token_hits: dict[int, float] = defaultdict(float)
-    tokens = set(aicrush_tokenize(content))
-    for token in tokens:
-        candidate_ids = token_map.get(token)
-        if not isinstance(candidate_ids, list) or not candidate_ids or len(candidate_ids) > 2:
-            continue
-        for candidate_id in candidate_ids:
-            if candidate_id == author_id or candidate_id in direct_target_ids:
-                continue
-            token_hits[int(candidate_id)] += 0.35 if len(candidate_ids) == 1 else 0.18
-
-    padded = f" {content} "
-    for phrase, candidate_ids in phrase_map.items():
-        if not isinstance(candidate_ids, list) or not candidate_ids or len(candidate_ids) > 2:
-            continue
-        if len(phrase) < 4:
-            continue
-        if f" {phrase} " not in padded and phrase not in padded:
-            continue
-        for candidate_id in candidate_ids:
-            if candidate_id == author_id or candidate_id in direct_target_ids:
-                continue
-            token_hits[int(candidate_id)] += 0.75 if len(candidate_ids) == 1 else 0.4
-    return {
-        candidate_id: round(score, 4)
-        for candidate_id, score in token_hits.items()
-        if score >= 0.35
-    }
-
-
-def _aicrush_track_recent_channel_author(
-    guild_id: int,
-    channel_id: int,
-    author_id: int,
-    created_ts: float,
-) -> list[int]:
-    key = (guild_id, channel_id)
-    queue = AICRUSH_CHANNEL_RECENT_AUTHORS[key]
-    while queue and created_ts - queue[0][0] > AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS:
-        queue.popleft()
-    others = {other_author for _, other_author in queue if other_author != author_id}
-    queue.append((created_ts, author_id))
-    return list(others)
-
-
-def _aicrush_invalidate_result_cache(guild_id: int, user_ids: set[int]) -> None:
-    if not user_ids:
-        return
-    for cache_key in list(AICRUSH_RESULT_CACHE.keys()):
-        if cache_key[0] == guild_id and cache_key[1] in user_ids:
-            AICRUSH_RESULT_CACHE.pop(cache_key, None)
-
-
-def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -> set[int]:
-    if message.guild is None or message.author.bot:
-        return set()
-    member = message.author if isinstance(message.author, discord.Member) else None
-    if member is None:
-        return set()
-    content = message.clean_content.strip()
-    if not content and not message.attachments:
-        return set()
-    if not content and message.attachments:
-        content = "[attachment]"
-
-    created_ts = message.created_at.timestamp()
-    guild_state = get_guild_aicrush_state(message.guild.id)
-    meta = guild_state.setdefault("meta", {})
-    channel_state = guild_state.setdefault("channels", {}).setdefault(str(message.channel.id), {})
-    channel_state["latest_message_id"] = max(
-        int(channel_state.get("latest_message_id", 0) or 0),
-        int(message.id),
-    )
-    existing_earliest = int(channel_state.get("earliest_message_id", 0) or 0)
-    channel_state["earliest_message_id"] = (
-        int(message.id)
-        if existing_earliest <= 0
-        else min(existing_earliest, int(message.id))
-    )
-    channel_state["last_message_ts"] = max(
-        float(channel_state.get("last_message_ts", 0.0) or 0.0),
-        created_ts,
-    )
-    if backfill:
-        meta["last_backfill_ts"] = time.time()
-    else:
-        meta["last_incremental_ts"] = time.time()
-    meta["last_indexed_message_ts"] = max(
-        float(meta.get("last_indexed_message_ts", 0.0) or 0.0),
-        created_ts,
-    )
-    meta["messages_indexed"] = int(meta.get("messages_indexed", 0) or 0) + 1
-
-    _aicrush_update_user_profile(guild_state, member, content, created_ts)
-    direct_target_ids = {
-        int(mentioned.id)
-        for mentioned in message.mentions
-        if not mentioned.bot and mentioned.id != member.id
-    }
-    reply_target_id = _aicrush_resolve_reply_target_id(message)
-    impacted_ids: set[int] = {member.id}
-
-    _aicrush_remember_message_author(int(message.id), int(member.id), created_ts)
-
-    recent_others = _aicrush_track_recent_channel_author(
-        message.guild.id,
-        message.channel.id,
-        member.id,
-        created_ts,
-    )
-    for other_id in recent_others[:10]:
-        _aicrush_update_edge(
-            guild_state,
-            member.id,
-            other_id,
-            score=0.08,
-            kind="copresence",
-            created_ts=created_ts,
-            channel_id=message.channel.id,
-            sample_text=content,
-        )
-        impacted_ids.add(other_id)
-
-    for target_id in direct_target_ids:
-        _aicrush_update_edge(
-            guild_state,
-            member.id,
-            target_id,
-            score=2.0,
-            kind="mention",
-            created_ts=created_ts,
-            channel_id=message.channel.id,
-            sample_text=content,
-        )
-        impacted_ids.add(target_id)
-
-    if reply_target_id is not None and reply_target_id != member.id:
-        _aicrush_update_edge(
-            guild_state,
-            member.id,
-            reply_target_id,
-            score=2.8,
-            kind="reply",
-            created_ts=created_ts,
-            channel_id=message.channel.id,
-            sample_text=content,
-        )
-        impacted_ids.add(reply_target_id)
-
-    normalized_content = normalize_aicrush_text(content)
-    for target_id, hit_score in _aicrush_extract_name_hit_targets(
-        message.guild,
-        member.id,
-        normalized_content,
-        direct_target_ids=direct_target_ids,
-    ).items():
-        _aicrush_update_edge(
-            guild_state,
-            member.id,
-            target_id,
-            score=hit_score,
-            kind="name_hit",
-            created_ts=created_ts,
-            channel_id=message.channel.id,
-            sample_text=content,
-        )
-        impacted_ids.add(target_id)
-
-    _mark_aicrush_dirty()
-    _aicrush_invalidate_result_cache(message.guild.id, impacted_ids)
-    return impacted_ids
-
-
-async def run_aicrush_backfill(
-    guild: discord.Guild,
-    *,
-    message_budget: int | None = None,
-    time_budget_seconds: float | None = None,
-) -> dict[str, Any]:
-    guild_state = get_guild_aicrush_state(guild.id)
-    channels = get_readable_text_channels(guild)
-    if AICRUSH_MAX_CHANNELS > 0:
-        channels = channels[:AICRUSH_MAX_CHANNELS]
-    channel_rows = guild_state.setdefault("channels", {})
-    for channel in channels:
-        channel_rows.setdefault(
-            str(channel.id),
-            {
-                "latest_message_id": 0,
-                "earliest_message_id": 0,
-                "last_message_ts": 0.0,
-                "before_message_id": 0,
-                "fully_scanned": False,
-                "last_backfill_ts": 0.0,
-            },
-        )
-
-    budget_remaining = max(200, int(message_budget or AICRUSH_BACKFILL_MESSAGE_BUDGET))
-    end_time = time.monotonic() + float(
-        time_budget_seconds or AICRUSH_BACKFILL_TIME_BUDGET_SECONDS
-    )
-    fetched_messages: list[discord.Message] = []
-    touched_channel_ids: set[int] = set()
-    backfill_passes = 0
-    total_fetched = 0
-
-    while budget_remaining > 0 and time.monotonic() < end_time:
-        backfill_passes += 1
-        progress_this_pass = 0
-        channel_priority = sorted(
-            channels,
-            key=lambda channel: (
-                1 if bool(channel_rows.get(str(channel.id), {}).get("fully_scanned")) else 0,
-                float(channel_rows.get(str(channel.id), {}).get("last_backfill_ts", 0.0) or 0.0),
-            ),
-        )
-        for channel in channel_priority:
-            if budget_remaining <= 0 or time.monotonic() >= end_time:
-                break
-            row = channel_rows.setdefault(str(channel.id), {})
-            if bool(row.get("fully_scanned")):
-                continue
-            per_channel_limit = min(max(50, AICRUSH_SCAN_PER_CHANNEL), budget_remaining)
-            history_kwargs: dict[str, Any] = {"limit": per_channel_limit}
-            before_message_id = int(row.get("before_message_id", 0) or 0)
-            if before_message_id <= 0:
-                before_message_id = int(row.get("earliest_message_id", 0) or 0)
-            if before_message_id > 0:
-                history_kwargs["before"] = discord.Object(id=before_message_id)
-            batch: list[discord.Message] = []
-            try:
-                async for msg in channel.history(**history_kwargs):
-                    if not msg.author.bot:
-                        batch.append(msg)
-            except (discord.Forbidden, discord.HTTPException):
-                continue
-            row["last_backfill_ts"] = time.time()
-            if not batch:
-                row["fully_scanned"] = True
-                continue
-            oldest_id = min(int(msg.id) for msg in batch)
-            row["before_message_id"] = oldest_id
-            row["earliest_message_id"] = (
-                oldest_id
-                if int(row.get("earliest_message_id", 0) or 0) <= 0
-                else min(int(row.get("earliest_message_id", 0) or 0), oldest_id)
-            )
-            if len(batch) < per_channel_limit:
-                row["fully_scanned"] = True
-            fetched_messages.extend(batch)
-            budget_remaining -= len(batch)
-            progress_this_pass += len(batch)
-            total_fetched += len(batch)
-            touched_channel_ids.add(channel.id)
-            if (
-                AICRUSH_SCAN_PAUSE_EVERY > 0
-                and AICRUSH_SCAN_PAUSE_SECONDS > 0
-                and total_fetched % AICRUSH_SCAN_PAUSE_EVERY < len(batch)
-            ):
-                await asyncio.sleep(AICRUSH_SCAN_PAUSE_SECONDS)
-        if progress_this_pass <= 0:
-            break
-
-    fetched_messages.sort(key=lambda msg: (msg.created_at.timestamp(), int(msg.id)))
-    touched_user_ids: set[int] = set()
-    for msg in fetched_messages:
-        touched_user_ids.update(index_aicrush_message(msg, backfill=True))
-
-    channels_total = len(channels)
-    fully_scanned = sum(
-        1
-        for row in channel_rows.values()
-        if isinstance(row, dict) and bool(row.get("fully_scanned"))
-    )
-    meta = guild_state.setdefault("meta", {})
-    meta["last_backfill_ts"] = time.time()
-    _mark_aicrush_dirty()
-    _aicrush_invalidate_result_cache(guild.id, touched_user_ids)
-    return {
-        "scanned_messages": len(fetched_messages),
-        "channels_considered": channels_total,
-        "channels_touched": len(touched_channel_ids),
-        "channels_fully_scanned": fully_scanned,
-        "messages_indexed": int(meta.get("messages_indexed", 0) or 0),
-        "passes": backfill_passes,
-    }
-
-
-def _aicrush_edge_total_score(edge: dict[str, Any] | None) -> float:
-    if not isinstance(edge, dict):
-        return 0.0
-    return max(0.0, float(edge.get("score", 0.0) or 0.0))
-
-
-def _aicrush_topic_similarity(
-    left_topics: dict[str, int],
-    right_topics: dict[str, int],
-) -> float:
-    if not left_topics or not right_topics:
-        return 0.0
-    overlap = set(left_topics).intersection(right_topics)
-    if not overlap:
-        return 0.0
-    numerator = sum(min(int(left_topics[key]), int(right_topics[key])) for key in overlap)
-    denominator = max(
-        1,
-        sum(int(left_topics[key]) for key in left_topics)
-        + sum(int(right_topics[key]) for key in right_topics),
-    )
-    return round((2.0 * numerator) / denominator, 4)
-
-
-def _aicrush_merge_samples(*sample_groups: list[str], limit: int) -> list[str]:
-    merged: list[str] = []
-    for group in sample_groups:
-        for sample in group:
-            _aicrush_append_unique_sample(merged, sample, limit)
-    return merged[:limit]
-
-
-def _aicrush_merge_ranked_channel_ids(*channel_maps: dict[str, Any], limit: int) -> list[int]:
-    merged: Counter[int] = Counter()
-    for channel_map in channel_maps:
-        if not isinstance(channel_map, dict):
-            continue
-        for channel_key, raw_count in channel_map.items():
-            try:
-                channel_id = int(channel_key)
-                count = max(0, int(raw_count or 0))
-            except (TypeError, ValueError):
-                continue
-            if channel_id > 0 and count > 0:
-                merged[channel_id] += count
-    return [channel_id for channel_id, _ in merged.most_common(max(1, limit))]
-
-
-@dataclass
-class AICrushContext:
-    target_message_count: int
-    scanned_messages: int
-    target_topics: list[str]
-    outgoing_affinity: dict[int, float]
-    incoming_affinity: dict[int, float]
-    name_hit_affinity: dict[int, float]
-    reverse_name_hit_affinity: dict[int, float]
-    candidate_samples: dict[int, list[str]]
-    target_samples: list[str]
-    scan_coverage: dict[str, Any]
-    data_freshness_ts: float
-    outbound_counts: dict[int, int]
-    inbound_counts: dict[int, int]
-    topic_overlap: dict[int, float]
-    candidate_evidence: dict[int, dict[str, Any]]
-
-
-async def collect_aicrush_interactions(
-    guild: discord.Guild, target_user_id: int
-) -> "AICrushContext":
-    guild_state = get_guild_aicrush_state(guild.id)
-    users = guild_state.get("users", {})
-    edges = guild_state.get("edges", {})
-    target_row = users.get(str(target_user_id), {}) if isinstance(users, dict) else {}
-    target_topics_raw = target_row.get("topics", {}) if isinstance(target_row, dict) else {}
-    if not isinstance(target_topics_raw, dict):
-        target_topics_raw = {}
-    target_samples = target_row.get("samples", []) if isinstance(target_row, dict) else []
-    if not isinstance(target_samples, list):
-        target_samples = []
-
-    outgoing_edges = edges.get(str(target_user_id), {}) if isinstance(edges, dict) else {}
-    if not isinstance(outgoing_edges, dict):
-        outgoing_edges = {}
-
-    outgoing_affinity: dict[int, float] = {}
-    incoming_affinity: dict[int, float] = {}
-    name_hit_affinity: dict[int, float] = {}
-    reverse_name_hit_affinity: dict[int, float] = {}
-    candidate_samples: dict[int, list[str]] = {}
-    outbound_counts: dict[int, int] = {}
-    inbound_counts: dict[int, int] = {}
-    topic_overlap: dict[int, float] = {}
-    candidate_evidence: dict[int, dict[str, Any]] = {}
-    candidate_ids: set[int] = set()
-
-    for target_key, edge in outgoing_edges.items():
-        if not isinstance(edge, dict):
-            continue
-        try:
-            candidate_id = int(target_key)
-        except (TypeError, ValueError):
-            continue
-        if candidate_id == target_user_id:
-            continue
-        outgoing_affinity[candidate_id] = _aicrush_edge_total_score(edge)
-        name_hit_affinity[candidate_id] = float(edge.get("name_hit_score", 0.0) or 0.0)
-        outbound_counts[candidate_id] = int(edge.get("touch_count", 0) or 0)
-        candidate_ids.add(candidate_id)
-
-    if isinstance(edges, dict):
-        for source_key, source_edges in edges.items():
-            if not isinstance(source_edges, dict):
-                continue
-            edge = source_edges.get(str(target_user_id))
-            if not isinstance(edge, dict):
-                continue
-            try:
-                source_id = int(source_key)
-            except (TypeError, ValueError):
-                continue
-            if source_id == target_user_id:
-                continue
-            incoming_affinity[source_id] = _aicrush_edge_total_score(edge)
-            reverse_name_hit_affinity[source_id] = float(edge.get("name_hit_score", 0.0) or 0.0)
-            inbound_counts[source_id] = int(edge.get("touch_count", 0) or 0)
-            candidate_ids.add(source_id)
-
-    for candidate_id in candidate_ids:
-        candidate_row = users.get(str(candidate_id), {}) if isinstance(users, dict) else {}
-        candidate_topics = candidate_row.get("topics", {}) if isinstance(candidate_row, dict) else {}
-        if not isinstance(candidate_topics, dict):
-            candidate_topics = {}
-        topic_overlap[candidate_id] = _aicrush_topic_similarity(target_topics_raw, candidate_topics)
-        out_edge = outgoing_edges.get(str(candidate_id), {}) if isinstance(outgoing_edges, dict) else {}
-        in_edge = (
-            edges.get(str(candidate_id), {}).get(str(target_user_id), {})
-            if isinstance(edges, dict) and isinstance(edges.get(str(candidate_id)), dict)
-            else {}
-        )
-        candidate_samples[candidate_id] = _aicrush_merge_samples(
-            out_edge.get("samples", []) if isinstance(out_edge, dict) else [],
-            in_edge.get("samples", []) if isinstance(in_edge, dict) else [],
-            candidate_row.get("samples", []) if isinstance(candidate_row, dict) else [],
-            limit=8,
-        )
-        candidate_evidence[candidate_id] = {
-            "outgoing_mentions": int(out_edge.get("mention_count", 0) or 0)
-            if isinstance(out_edge, dict)
-            else 0,
-            "incoming_mentions": int(in_edge.get("mention_count", 0) or 0)
-            if isinstance(in_edge, dict)
-            else 0,
-            "outgoing_replies": int(out_edge.get("reply_count", 0) or 0)
-            if isinstance(out_edge, dict)
-            else 0,
-            "incoming_replies": int(in_edge.get("reply_count", 0) or 0)
-            if isinstance(in_edge, dict)
-            else 0,
-            "outgoing_copresence": float(out_edge.get("copresence_score", 0.0) or 0.0)
-            if isinstance(out_edge, dict)
-            else 0.0,
-            "incoming_copresence": float(in_edge.get("copresence_score", 0.0) or 0.0)
-            if isinstance(in_edge, dict)
-            else 0.0,
-            "outgoing_last_ts": float(out_edge.get("last_ts", 0.0) or 0.0)
-            if isinstance(out_edge, dict)
-            else 0.0,
-            "incoming_last_ts": float(in_edge.get("last_ts", 0.0) or 0.0)
-            if isinstance(in_edge, dict)
-            else 0.0,
-            "channel_ids": _aicrush_merge_ranked_channel_ids(
-                out_edge.get("channels", {}) if isinstance(out_edge, dict) else {},
-                in_edge.get("channels", {}) if isinstance(in_edge, dict) else {},
-                limit=4,
-            ),
-        }
-
-    channels = guild_state.get("channels", {})
-    channels_total = len(channels) if isinstance(channels, dict) else 0
-    channels_fully_scanned = 0
-    if isinstance(channels, dict):
-        channels_fully_scanned = sum(
-            1
-            for row in channels.values()
-            if isinstance(row, dict) and bool(row.get("fully_scanned"))
-        )
-    meta = guild_state.get("meta", {})
-    freshness_ts = max(
-        float(meta.get("last_indexed_message_ts", 0.0) or 0.0),
-        float(meta.get("last_backfill_ts", 0.0) or 0.0),
-    )
-    return AICrushContext(
-        target_message_count=int(target_row.get("message_count", 0) or 0) if isinstance(target_row, dict) else 0,
-        scanned_messages=int(meta.get("messages_indexed", 0) or 0) if isinstance(meta, dict) else 0,
-        target_topics=[
-            topic
-            for topic, _ in sorted(
-                target_topics_raw.items(), key=lambda item: int(item[1]), reverse=True
-            )[:8]
-        ],
-        outgoing_affinity=outgoing_affinity,
-        incoming_affinity=incoming_affinity,
-        name_hit_affinity=name_hit_affinity,
-        reverse_name_hit_affinity=reverse_name_hit_affinity,
-        candidate_samples=candidate_samples,
-        target_samples=target_samples[:10],
-        scan_coverage={
-            "channels_total": channels_total,
-            "channels_fully_scanned": channels_fully_scanned,
-            "messages_indexed": int(meta.get("messages_indexed", 0) or 0) if isinstance(meta, dict) else 0,
-        },
-        data_freshness_ts=freshness_ts,
-        outbound_counts=outbound_counts,
-        inbound_counts=inbound_counts,
-        topic_overlap=topic_overlap,
-        candidate_evidence=candidate_evidence,
-    )
-
-
-def aicrush_recency_weight(reference_ts: float, event_ts: float) -> float:
-    age_hours = max(0.0, (reference_ts - event_ts) / 3600)
-    return max(0.25, pow(0.965, age_hours))
-
-
-def _aicrush_gender_compatibility_bonus(
-    target_gender: str | None, candidate_gender: str | None
-) -> float:
-    if target_gender is None or candidate_gender is None:
-        return 0.0
-    if target_gender != candidate_gender:
-        return 0.7
-    return -0.15
-
-
-def _aicrush_confidence_from_pool(candidates: list[dict[str, Any]]) -> tuple[float, str]:
-    if not candidates:
-        return 0.0, "none"
-    top = float(candidates[0].get("heuristic_score", 0.0))
-    second = float(candidates[1].get("heuristic_score", 0.0)) if len(candidates) > 1 else 0.0
-    dominance = top / max(0.1, top + second)
-    evidence = min(1.0, float(candidates[0].get("evidence_density", 0.0)))
-    confidence = max(0.08, min(0.97, (dominance * 0.55) + (evidence * 0.45)))
-    if confidence >= 0.8:
-        band = "high"
-    elif confidence >= 0.58:
-        band = "medium"
-    else:
-        band = "low"
-    return confidence, band
-
-
-async def build_aicrush_directional_candidate_pool(
-    guild: discord.Guild,
-    target_member: discord.Member,
-    context: "AICrushContext",
-    *,
-    direction: Literal["crush", "admirer"],
-    limit: int = 8,
-) -> tuple[list[dict[str, Any]], str | None]:
-    target_gender = detect_member_gender_from_roles(target_member)
-    expected_gender = None
-    if target_gender == "male":
-        expected_gender = "female"
-    elif target_gender == "female":
-        expected_gender = "male"
-
-    candidate_ids = set(context.outgoing_affinity).union(context.incoming_affinity)
-    ranked: list[dict[str, Any]] = []
-    for candidate_id in candidate_ids:
-        if candidate_id == target_member.id:
-            continue
-        candidate = guild.get_member(candidate_id)
-        if candidate is None:
-            try:
-                candidate = await guild.fetch_member(candidate_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                continue
-        if candidate.bot:
-            continue
-
-        out_score = float(context.outgoing_affinity.get(candidate_id, 0.0))
-        in_score = float(context.incoming_affinity.get(candidate_id, 0.0))
-        name_score = float(context.name_hit_affinity.get(candidate_id, 0.0))
-        reverse_name_score = float(context.reverse_name_hit_affinity.get(candidate_id, 0.0))
-        overlap_score = float(context.topic_overlap.get(candidate_id, 0.0))
-        reciprocal_score = min(out_score, in_score)
-        outgoing_touches = int(context.outbound_counts.get(candidate_id, 0))
-        incoming_touches = int(context.inbound_counts.get(candidate_id, 0))
-        touch_volume = outgoing_touches + incoming_touches
-        evidence = context.candidate_evidence.get(candidate_id, {})
-        outgoing_mentions = int(evidence.get("outgoing_mentions", 0) or 0)
-        incoming_mentions = int(evidence.get("incoming_mentions", 0) or 0)
-        outgoing_replies = int(evidence.get("outgoing_replies", 0) or 0)
-        incoming_replies = int(evidence.get("incoming_replies", 0) or 0)
-        outgoing_copresence = float(evidence.get("outgoing_copresence", 0.0) or 0.0)
-        incoming_copresence = float(evidence.get("incoming_copresence", 0.0) or 0.0)
-        recent_signal_ts = max(
-            float(evidence.get("outgoing_last_ts", 0.0) or 0.0),
-            float(evidence.get("incoming_last_ts", 0.0) or 0.0),
-        )
-        recency_bonus = (
-            aicrush_recency_weight(max(context.data_freshness_ts, time.time()), recent_signal_ts)
-            if recent_signal_ts > 0
-            else 0.25
-        )
-        candidate_gender = detect_member_gender_from_roles(candidate)
-        preferred_gender_match = (
-            expected_gender is not None
-            and candidate_gender is not None
-            and candidate_gender == expected_gender
-        )
-        gender_bonus = _aicrush_gender_compatibility_bonus(target_gender, candidate_gender)
-        if direction == "crush":
-            direction_score = out_score
-            heuristic_score = (
-                out_score * 1.18
-                + in_score * 0.28
-                + reciprocal_score * 0.92
-                + name_score * 0.75
-                + overlap_score * 1.45
-                + min(1.5, touch_volume * 0.08)
-                + min(0.9, outgoing_replies * 0.09)
-                + min(0.45, outgoing_mentions * 0.05)
-                + min(0.4, outgoing_copresence * 0.35)
-                + recency_bonus * 0.45
-                + gender_bonus
-            )
-        else:
-            direction_score = in_score
-            heuristic_score = (
-                in_score * 1.24
-                + out_score * 0.18
-                + reciprocal_score * 0.88
-                + reverse_name_score * 0.85
-                + overlap_score * 1.25
-                + min(1.4, touch_volume * 0.07)
-                + min(0.9, incoming_replies * 0.1)
-                + min(0.45, incoming_mentions * 0.05)
-                + min(0.4, incoming_copresence * 0.35)
-                + recency_bonus * 0.45
-                + gender_bonus * 0.8
-            )
-        evidence_density = min(
-            1.0,
-            (
-                direction_score
-                + reciprocal_score
-                + name_score
-                + reverse_name_score
-                + (touch_volume * 0.14)
-                + (overlap_score * 2.4)
-                + ((outgoing_mentions + incoming_mentions) * 0.1)
-                + ((outgoing_replies + incoming_replies) * 0.12)
-                + (recency_bonus * 0.85)
-            ) / 9.0,
-        )
-        ranked.append(
-            {
-                "member": candidate,
-                "direction": direction,
-                "direction_score": round(direction_score, 4),
-                "heuristic_score": round(heuristic_score, 4),
-                "outgoing_score": round(out_score, 4),
-                "incoming_score": round(in_score, 4),
-                "name_score": round(name_score, 4),
-                "reverse_name_score": round(reverse_name_score, 4),
-                "topic_overlap": round(overlap_score, 4),
-                "reciprocal_score": round(reciprocal_score, 4),
-                "outgoing": outgoing_touches,
-                "incoming": incoming_touches,
-                "touch_volume": touch_volume,
-                "evidence_density": round(evidence_density, 4),
-                "candidate_gender": candidate_gender,
-                "preferred_gender_match": preferred_gender_match,
-                "samples": context.candidate_samples.get(candidate_id, []),
-                "outgoing_mentions": outgoing_mentions,
-                "incoming_mentions": incoming_mentions,
-                "outgoing_replies": outgoing_replies,
-                "incoming_replies": incoming_replies,
-                "outgoing_copresence": round(outgoing_copresence, 4),
-                "incoming_copresence": round(incoming_copresence, 4),
-                "recency_bonus": round(recency_bonus, 4),
-                "channel_ids": evidence.get("channel_ids", []),
-            }
-        )
-
-    ranked = [
-        row
-        for row in ranked
-        if float(row.get("direction_score", 0.0)) > 0
-        or float(row.get("heuristic_score", 0.0)) > 0.75
-    ]
-    ranked.sort(
-        key=lambda row: (
-            -float(row.get("heuristic_score", 0.0)),
-            -float(row.get("direction_score", 0.0)),
-            -float(row.get("evidence_density", 0.0)),
-        )
-    )
-    return ranked[: max(1, limit)], target_gender
-
-
-def _aicrush_rank_schema() -> dict[str, Any]:
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "aicrush_pick",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "picked_user_id": {"type": "integer"},
-                    "confidence": {"type": "number"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["picked_user_id", "confidence", "reason"],
-                "additionalProperties": False,
-            },
-        },
-    }
-
-
-async def rerank_aicrush_candidates_with_ai(
-    target_member: discord.Member,
-    *,
-    target_gender: str | None,
-    context: "AICrushContext",
-    candidates: list[dict[str, Any]],
-    direction: Literal["crush", "admirer"],
-) -> tuple[int | None, str, float]:
-    if len(candidates) < 2:
-        return None, "", 0.0
-
-    allowed_ids = {
-        int(row["member"].id)
-        for row in candidates
-        if isinstance(row.get("member"), discord.Member)
-    }
-    if len(allowed_ids) < 2:
-        return None, "", 0.0
-
-    target_para = lines_to_paragraph(
-        context.target_samples,
-        int(AICRUSH_MAX_CONTEXT_CHARS * 0.32),
-    )
-    candidate_chunks: list[str] = []
-    for row in candidates[:7]:
-        candidate = row.get("member")
-        if not isinstance(candidate, discord.Member):
-            continue
-        cid = int(candidate.id)
-        candidate_para = lines_to_paragraph(
-            row.get("samples", []),
-            int(AICRUSH_MAX_CONTEXT_CHARS * 0.14),
-        )
-        candidate_chunks.append(
-            (
-                f"- user_id: {cid}\n"
-                f"  name: {candidate.display_name}\n"
-                f"  direction: {direction}\n"
-                f"  heuristic_score: {float(row.get('heuristic_score', 0.0)):.3f}\n"
-                f"  direction_score: {float(row.get('direction_score', 0.0)):.3f}\n"
-                f"  outgoing_score: {float(row.get('outgoing_score', 0.0)):.3f}\n"
-                f"  incoming_score: {float(row.get('incoming_score', 0.0)):.3f}\n"
-                f"  name_score: {float(row.get('name_score', 0.0)):.3f}\n"
-                f"  reverse_name_score: {float(row.get('reverse_name_score', 0.0)):.3f}\n"
-                f"  topic_overlap: {float(row.get('topic_overlap', 0.0)):.3f}\n"
-                f"  evidence_density: {float(row.get('evidence_density', 0.0)):.3f}\n"
-                f"  candidate_context: {candidate_para or '(limited)'}"
-            )
-        )
-    if len(candidate_chunks) < 2:
-        return None, "", 0.0
-
-    direction_instruction = (
-        "Pick who the target member most likely has a crush on."
-        if direction == "crush"
-        else "Pick who most likely has a crush on the target member."
-    )
-    prompt = (
-        "Rank a playful Discord crush candidate from evidence only.\n"
-        f"{direction_instruction}\n"
-        "Use replies, mentions, plain-text name references, mutuality, and topic overlap.\n"
-        "Treat gender hint only as a soft boost. Do not force it.\n"
-        "Return only the required JSON fields.\n\n"
-        f"Target member: {target_member.display_name}\n"
-        f"Target gender hint: {target_gender or 'unknown'}\n"
-        f"Target topics: {', '.join(context.target_topics) or 'limited'}\n"
-        f"Target samples: {target_para or '(limited)'}\n\n"
-        "Candidates:\n"
-        + "\n".join(candidate_chunks)
-    )
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an evidence-based ranking assistant for a Discord relationship inference feature. "
-                "Be conservative, prefer interaction evidence over speculation, and avoid certainty claims."
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
-
-    payload: dict[str, Any] | None = None
-    if GROQ_API_KEY:
-        try:
-            raw = await request_groq_completion(
-                messages,
-                max_tokens=180,
-                temperature=0.1,
-                model_override=AICRUSH_RANK_MODEL or None,
-                fallback_models=AICRUSH_FALLBACK_MODELS,
-                response_format=_aicrush_rank_schema(),
-                include_fallback_notice=False,
-                feature=f"aicrush_ranker_{direction}",
-            )
-            payload = _extract_first_json_object(raw)
-        except Exception:
-            payload = None
-    if payload is None:
-        try:
-            raw = await request_ai_completion(
-                messages,
-                max_tokens=180,
-                temperature=0.15,
-                policy_key=f"aicrush_ranker_{direction}",
-                model_override=(AICRUSH_RANK_MODEL or None) if AI_PROVIDER == "groq" else None,
-                fallback_models=AICRUSH_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
-                include_fallback_notice=False,
-            )
-        except Exception:
-            return None, "", 0.0
-        payload = _extract_first_json_object(raw)
-    if not isinstance(payload, dict):
-        return None, "", 0.0
-
-    try:
-        picked_id = int(payload.get("picked_user_id"))
-    except (TypeError, ValueError):
-        return None, "", 0.0
-    if picked_id not in allowed_ids:
-        return None, "", 0.0
-    try:
-        confidence = max(0.0, min(1.0, float(payload.get("confidence", 0.0) or 0.0)))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    reason = " ".join(str(payload.get("reason", "")).split()).strip()[:260]
-    return picked_id, reason, confidence
-
-
-def _aicrush_pick_row(
-    candidates: list[dict[str, Any]],
-    picked_id: int | None,
-) -> dict[str, Any] | None:
-    if not candidates:
-        return None
-    if picked_id is None:
-        return candidates[0]
-    for row in candidates:
-        member = row.get("member")
-        if isinstance(member, discord.Member) and int(member.id) == picked_id:
-            return row
-    return candidates[0]
-
-
-def _aicrush_direction_summary(label: str, row: dict[str, Any] | None) -> str:
-    if row is None:
-        return f"{label}: no clear signal yet"
-    member = row.get("member")
-    if not isinstance(member, discord.Member):
-        return f"{label}: unresolved"
-    return (
-        f"{label}: {member.display_name} | out `{float(row.get('outgoing_score', 0.0)):.2f}` | "
-        f"in `{float(row.get('incoming_score', 0.0)):.2f}` | name `{float(row.get('name_score', 0.0) or row.get('reverse_name_score', 0.0)):.2f}`"
-    )
-
-
-def _aicrush_channel_names(guild: discord.Guild, channel_ids: list[int], limit: int = 3) -> str:
-    names: list[str] = []
-    for raw_channel_id in channel_ids[: max(1, limit)]:
-        try:
-            channel_id = int(raw_channel_id)
-        except (TypeError, ValueError):
-            continue
-        channel = guild.get_channel(channel_id)
-        if isinstance(channel, (discord.TextChannel, discord.Thread)):
-            names.append(f"#{channel.name}")
-    return ", ".join(names) if names else "cross-channel"
-
-
-def _aicrush_sample_texture(samples: list[str], limit: int = 2) -> str:
-    texture: list[str] = []
-    for raw_sample in samples[: max(1, limit)]:
-        cleaned = " ".join(str(raw_sample).split()).strip()
-        if not cleaned:
-            continue
-        if len(cleaned) > 90:
-            cleaned = cleaned[:87].rstrip() + "..."
-        quoted = f"\"{cleaned}\""
-        if quoted not in texture:
-            texture.append(quoted)
-    return " | ".join(texture) if texture else "limited sample text"
-
-
-def _aicrush_direction_evidence_line(
-    target_member: discord.Member,
-    *,
-    label: str,
-    row: dict[str, Any] | None,
-) -> str:
-    if row is None:
-        return f"{label}: no concentrated directional signal yet."
-    member = row.get("member")
-    if not isinstance(member, discord.Member):
-        return f"{label}: unresolved candidate."
-    if label == "Likely crush":
-        replies = int(row.get("outgoing_replies", 0) or 0)
-        mentions = int(row.get("outgoing_mentions", 0) or 0)
-        name_hits = float(row.get("name_score", 0.0) or 0.0)
-        actor_text = f"{target_member.display_name} -> {member.display_name}"
-    else:
-        replies = int(row.get("incoming_replies", 0) or 0)
-        mentions = int(row.get("incoming_mentions", 0) or 0)
-        name_hits = float(row.get("reverse_name_score", 0.0) or 0.0)
-        actor_text = f"{member.display_name} -> {target_member.display_name}"
-    return (
-        f"{label}: {actor_text} | replies `{replies}` | mentions `{mentions}` | "
-        f"name hits `{name_hits:.2f}` | topic overlap `{float(row.get('topic_overlap', 0.0)):.2f}` | "
-        f"mutual traffic `{int(row.get('touch_volume', 0) or 0)}` | "
-        f"shared channels `{_aicrush_channel_names(target_member.guild, row.get('channel_ids', []))}`."
-    )
-
-
-async def build_aicrush_pair_explanation(
-    target_member: discord.Member,
-    *,
-    crush_row: dict[str, Any] | None,
-    admirer_row: dict[str, Any] | None,
-    context: "AICrushContext",
-    crush_confidence: float,
-    admirer_confidence: float,
-) -> str:
-    target_topics = ", ".join(context.target_topics[:6]) or "limited topic evidence"
-    target_texture = _aicrush_sample_texture(context.target_samples, limit=2)
-    crush_texture = _aicrush_sample_texture(
-        crush_row.get("samples", []) if isinstance(crush_row, dict) else [],
-        limit=2,
-    )
-    admirer_texture = _aicrush_sample_texture(
-        admirer_row.get("samples", []) if isinstance(admirer_row, dict) else [],
-        limit=2,
-    )
-    local_reason = "\n".join(
-        [
-            _aicrush_direction_evidence_line(
-                target_member,
-                label="Likely crush",
-                row=crush_row,
-            ),
-            _aicrush_direction_evidence_line(
-                target_member,
-                label="Likely admirer",
-                row=admirer_row,
-            ),
-            f"Target chat themes: {target_topics}.",
-            f"Target sample texture: {target_texture}.",
-            f"Candidate sample texture: crush {crush_texture}; admirer {admirer_texture}.",
-        ]
-    )
-    if not GROQ_API_KEY and not is_ai_configured():
-        return local_reason
-
-    prompt = (
-        "Rewrite the evidence summary into a detailed Discord crush explanation.\n"
-        "Keep it to 4-6 short lines, evidence-first, fun-only, no explicit content, and no certainty claims.\n"
-        "Do not invent facts. Reuse the supplied signals, channels, themes, and sample texture.\n"
-        "Mention uncertainty if the evidence feels sparse.\n"
-        f"Target: {target_member.display_name}\n"
-        f"Crush confidence: {crush_confidence:.2f}\n"
-        f"Admirer confidence: {admirer_confidence:.2f}\n"
-        "Evidence summary:\n"
-        f"{local_reason}"
-    )
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You write evidence-based Discord feature copy. Keep it playful but grounded in the supplied chat evidence, "
-                "avoid harsh claims, and mention uncertainty when evidence is sparse."
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
-    try:
-        if GROQ_API_KEY:
-            return await request_groq_completion(
-                messages,
-                max_tokens=220,
-                temperature=0.45,
-                model_override=AICRUSH_EXPLAIN_MODEL or None,
-                fallback_models=AICRUSH_FALLBACK_MODELS,
-                feature="aicrush_explain",
-            )
-        return await request_ai_completion(
-            messages,
-            max_tokens=220,
-            temperature=0.45,
-            policy_key="aicrush_explain",
-            model_override=(AICRUSH_EXPLAIN_MODEL or None) if AI_PROVIDER == "groq" else None,
-            fallback_models=AICRUSH_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
-        )
-    except Exception:
-        return local_reason
 
 
 def _altfinder_name_aliases(display_name: str, username: str) -> dict[str, list[str]]:
@@ -13502,11 +12016,11 @@ def _capability_domain_from_command(command_name: str, aliases: list[str]) -> st
     }
     ai = {
         "aimodel", "aimodels", "aireset", "psych", "myvibe", "vibe", "vibecheck", "roast",
-        "serverlore", "aicrush", "analyze", "lie_detector", "futureme", "rizzcoach", "argument",
+        "serverlore", "crush", "analyze", "lie_detector", "futureme", "rizzcoach", "argument",
         "debate", "ai", "ask", "aisummary", "catchup", "catchupchannel", "serverinsights",
     }
     engagement = {"rank", "leaderboard", "streak", "daily", "quests", "event", "engagementhub", "autoloops", "questmode", "engagementtz", "engagementlimits"}
-    utility = {"help", "say", "cat", "cats", "food", "ping", "avatar", "userinfo", "serverinfo", "poll", "snipe", "remind", "setgenderroles", "genderroles", "cleargenderroles", "welcomeconcierge", "setintrochannel", "clearintrochannel"}
+    utility = {"help", "say", "cat", "cats", "food", "ping", "avatar", "userinfo", "serverinfo", "poll", "snipe", "remind", "exclude", "wipe", "welcomeconcierge", "setintrochannel", "clearintrochannel"}
 
     if token_set.intersection(moderation):
         return "moderation"
@@ -13530,8 +12044,8 @@ def _capability_mod_only_from_command(command: commands.Command, command_name: s
         "pb", "pba", "clear", "bulkdelete", "kick", "ban", "unban", "mute", "unmute",
         "lock", "unlock", "slowmode", "warn", "warnings", "clearwarns", "setmodlog",
         "clearmodlog", "reloadbadwords", "automod", "aiguard", "aimodmode", "modqueue",
-        "case", "override", "modguard", "escalation", "setgenderroles", "genderroles",
-        "cleargenderroles", "welcomeconcierge", "setintrochannel", "clearintrochannel",
+        "case", "override", "modguard", "escalation", "crushgame",
+        "welcomeconcierge", "setintrochannel", "clearintrochannel",
         "engagementlimits", "engagementhub", "autoloops", "questmode", "engagementtz",
         "markethalt", "serverinsights", "say",
     }
@@ -14123,7 +12637,7 @@ BOT_GUIDE_KB: list[dict[str, object]] = [
         "title": "Fun Social Features",
         "keywords": (
             "roast",
-            "aicrush",
+            "crush",
             "analyze",
             "vibe",
             "vibecheck",
@@ -14134,9 +12648,10 @@ BOT_GUIDE_KB: list[dict[str, object]] = [
             "argument",
         ),
         "content": (
-            f"Popular commands: `{PREFIX}roast`, `{PREFIX}aicrush`, `{PREFIX}analyze`, `{PREFIX}vibe`, `{PREFIX}vibecheck`.\n"
+            f"Popular commands: `{PREFIX}roast`, `{PREFIX}crush`, `{PREFIX}analyze`, `{PREFIX}vibe`, `{PREFIX}vibecheck`.\n"
             f"Other AI fun: `{PREFIX}serverlore`, `{PREFIX}futureme`, `{PREFIX}rizzcoach`, `{PREFIX}debate`, `{PREFIX}argument`.\n"
-            "Most fun commands also work conversationally when you address Bell."
+            "Most fun commands also work conversationally when you address Bell.\n"
+            f"Opt out of fun features any time with `{PREFIX}exclude`; delete your stored fun data with `{PREFIX}wipe`."
         ),
     },
     {
@@ -17129,11 +15644,6 @@ async def engagement_state_flush_loop() -> None:
     await flush_engagement_state()
 
 
-@tasks.loop(seconds=float(AICRUSH_STATE_FLUSH_SECONDS))
-async def aicrush_state_flush_loop() -> None:
-    await flush_aicrush_state()
-
-
 @tasks.loop(seconds=float(ALTFINDER_STATE_FLUSH_SECONDS))
 async def altfinder_state_flush_loop() -> None:
     await flush_altfinder_state()
@@ -17283,8 +15793,6 @@ async def on_ready() -> None:
             engagement_state_flush_loop.start()
         if not engagement_tick_loop.is_running():
             engagement_tick_loop.start()
-    if not aicrush_state_flush_loop.is_running():
-        aicrush_state_flush_loop.start()
     if not altfinder_state_flush_loop.is_running():
         altfinder_state_flush_loop.start()
     if not socialintel_state_flush_loop.is_running():
@@ -17490,11 +15998,6 @@ async def on_message(message: discord.Message) -> None:
         print(f"[AI GUARD PIPELINE ERROR] {error}")
 
     try:
-        index_aicrush_message(message, backfill=False)
-    except Exception as error:
-        print(f"[AICRUSH INDEX ERROR] {error}")
-
-    try:
         index_altfinder_message(message, backfill=False)
     except Exception as error:
         print(f"[ALTFINDER INDEX ERROR] {error}")
@@ -17674,8 +16177,7 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}clearwarns <@member>`\n"
         f"`{PREFIX}setmodlog [#channel]` - Set mod-log channel (defaults to current channel).\n"
         f"`{PREFIX}clearmodlog` - Disable mod-log for this server.\n"
-        f"`{PREFIX}setgenderroles <@male_role> <@female_role>` - Set role mapping for `aicrush`.\n"
-        f"`{PREFIX}genderroles` / `{PREFIX}cleargenderroles`\n"
+        f"`{PREFIX}crushgame <on|off|status> [#channel]` - Enable the Crush-o-Meter game (posts a one-time notice).\n"
         f"`{PREFIX}welcomeconcierge <on|off|status>` - Control AI welcome onboarding DMs.\n"
         f"`{PREFIX}setintrochannel [#channel]` / `{PREFIX}clearintrochannel`\n"
         f"`{PREFIX}automod <on|off|toggle|status>` - Enable or disable AutoMod in this server.\n"
@@ -17739,7 +16241,8 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}serverinsights [hours]` - Mod-only engagement insights across channels.\n"
         f"`{PREFIX}psych [start|stop|reset|status] [message]` - Listen-first psych mode (replies after pause, asks before advice).\n"
         f"`{PREFIX}roast <@user> [soft|friendly|brutal]` - Personal roast from server-wide chat patterns.\n"
-        f"`{PREFIX}serverlore`, `{PREFIX}aicrush <@user>`, `{PREFIX}analyze <@user>`\n"
+        f"`{PREFIX}serverlore`, `{PREFIX}crush [@user] [answer]` (a joke game about you), `{PREFIX}analyze <@user>`\n"
+        f"`{PREFIX}exclude` / `{PREFIX}include` - Opt out of (or back into) fun features. `{PREFIX}wipe` - Delete your stored fun data.\n"
         f"`{PREFIX}lie_detector <@user> <message>`, `{PREFIX}futureme`\n"
         f"`{PREFIX}rizzcoach [smooth|funny|mysterious] <message>`\n"
         f"`{PREFIX}argument <topic>` - starts persistent argument mode (`bell stop argument` to end).\n"
@@ -17790,44 +16293,6 @@ async def clear_modlog_channel(ctx: commands.Context) -> None:
         del config[guild_key]["mod_log_channel_id"]
         save_mod_config(config)
     await ctx.send("Mod-log channel disabled for this server.")
-
-
-@bot.command(name="setgenderroles")
-@commands.has_permissions(manage_guild=True)
-async def set_gender_roles(
-    ctx: commands.Context, male_role: discord.Role, female_role: discord.Role
-) -> None:
-    if male_role.id == female_role.id:
-        await ctx.send("Male and female roles must be different.")
-        return
-    set_guild_gender_role_ids(ctx.guild.id, [male_role.id], [female_role.id])
-    await ctx.send(
-        f"Gender roles configured for this server.\n"
-        f"Male role: {male_role.mention}\n"
-        f"Female role: {female_role.mention}"
-    )
-
-
-@bot.command(name="genderroles")
-@commands.has_permissions(manage_guild=True)
-async def gender_roles_status(ctx: commands.Context) -> None:
-    male_ids, female_ids = get_guild_gender_role_ids(ctx.guild.id)
-    male_roles = [ctx.guild.get_role(role_id) for role_id in sorted(male_ids)]
-    female_roles = [ctx.guild.get_role(role_id) for role_id in sorted(female_ids)]
-    male_text = ", ".join(role.mention for role in male_roles if role) or "(not set)"
-    female_text = ", ".join(role.mention for role in female_roles if role) or "(not set)"
-    await ctx.send(
-        f"Configured gender role mapping:\n"
-        f"Male: {male_text}\n"
-        f"Female: {female_text}"
-    )
-
-
-@bot.command(name="cleargenderroles")
-@commands.has_permissions(manage_guild=True)
-async def clear_gender_roles(ctx: commands.Context) -> None:
-    clear_guild_gender_role_ids(ctx.guild.id)
-    await ctx.send("Cleared server-specific gender role mapping.")
 
 
 @bot.command(name="welcomeconcierge")
@@ -20934,6 +19399,8 @@ async def psych_command(ctx: commands.Context, *, input_text: str | None = None)
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
 async def my_vibe_command(ctx: commands.Context, count: int = VIBE_DEFAULT_MESSAGE_COUNT) -> None:
+    if await refuse_fun_excluded(ctx, ctx.author):
+        return
     if not await enforce_fun_rate_limit_ctx(ctx):
         return
     if not is_ai_configured():
@@ -20979,6 +19446,8 @@ async def my_vibe_command(ctx: commands.Context, count: int = VIBE_DEFAULT_MESSA
 async def vibe_command(
     ctx: commands.Context, member: discord.Member, count: int = VIBE_DEFAULT_MESSAGE_COUNT
 ) -> None:
+    if await refuse_fun_excluded(ctx, member):
+        return
     if not await enforce_fun_rate_limit_ctx(ctx):
         return
     if member.bot:
@@ -21026,6 +19495,8 @@ async def vibe_command(
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
 async def vibecheck_command(ctx: commands.Context, member: discord.Member) -> None:
+    if await refuse_fun_excluded(ctx, member):
+        return
     if not await enforce_fun_rate_limit_ctx(ctx):
         return
     if member.bot:
@@ -21063,6 +19534,8 @@ async def roast_command(
     member: discord.Member,
     style: Literal["soft", "friendly", "brutal"] = "friendly",
 ) -> None:
+    if await refuse_fun_excluded(ctx, member):
+        return
     if member.bot:
         await ctx.send("I do not roast bot accounts.")
         return
@@ -21576,195 +20049,6 @@ async def arcreport_command(
     await send_chunked(ctx, result)
 
 
-@bot.hybrid_command(name="aicrush")
-@commands.cooldown(2, 60, commands.BucketType.user)
-@commands.guild_only()
-async def aicrush_command(ctx: commands.Context, member: discord.Member) -> None:
-    if member.bot:
-        await ctx.send("This command is for server members only.")
-        return
-    if not await enforce_fun_rate_limit_ctx(ctx):
-        return
-
-    cache_key = (ctx.guild.id, member.id)
-    now = time.monotonic()
-    guild_aicrush_state = get_guild_aicrush_state(ctx.guild.id)
-    channels_state = guild_aicrush_state.get("channels", {})
-    fully_scanned = 0
-    channels_total = len(channels_state) if isinstance(channels_state, dict) else 0
-    if isinstance(channels_state, dict):
-        fully_scanned = sum(
-            1
-            for row in channels_state.values()
-            if isinstance(row, dict) and bool(row.get("fully_scanned"))
-        )
-    meta = guild_aicrush_state.get("meta", {})
-    last_backfill_ts = float(meta.get("last_backfill_ts", 0.0) or 0.0) if isinstance(meta, dict) else 0.0
-    cache_allowed = (
-        channels_total > 0
-        and fully_scanned >= channels_total
-        and last_backfill_ts > 0
-        and (time.time() - last_backfill_ts) <= AICRUSH_STATE_STALE_SECONDS
-    )
-    cached = AICRUSH_RESULT_CACHE.get(cache_key)
-    if cache_allowed and cached and now - cached[0] < AICRUSH_CACHE_SECONDS:
-        await send_chunked(ctx, cached[1] + "\n\n_(Cached result to avoid rate limits)_")
-        return
-
-    scan_lock = AICRUSH_LOCKS[cache_key]
-    if scan_lock.locked():
-        await ctx.send("`aicrush` scan already running for that user. Please wait a few seconds.")
-        return
-
-    async with ctx.typing():
-        async with scan_lock:
-            backfill_summary = await run_aicrush_backfill(
-                ctx.guild,
-                message_budget=AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES,
-                time_budget_seconds=AICRUSH_COMMAND_MAX_BACKFILL_SECONDS,
-            )
-            context = await collect_aicrush_interactions(ctx.guild, member.id)
-            crush_pool, target_gender = await build_aicrush_directional_candidate_pool(
-                ctx.guild,
-                member,
-                context,
-                direction="crush",
-                limit=10,
-            )
-            admirer_pool, _ = await build_aicrush_directional_candidate_pool(
-                ctx.guild,
-                member,
-                context,
-                direction="admirer",
-                limit=10,
-            )
-
-            if not crush_pool and not admirer_pool:
-                coverage = context.scan_coverage
-                result = (
-                    f"[AI CRUSH] for {member.display_name}\n"
-                    "Not enough evidence yet after deep scan.\n"
-                    f"Coverage: channels `{coverage.get('channels_fully_scanned', 0)}/{coverage.get('channels_total', 0)}` | "
-                    f"indexed msgs `{coverage.get('messages_indexed', 0)}` | "
-                    f"target msgs `{context.target_message_count}` | "
-                    f"freshly scanned `{backfill_summary.get('scanned_messages', 0)}` in `{backfill_summary.get('passes', 0)}` passes.\n"
-                    "No replies, mentions, or plain-name references were concentrated enough around one member yet.\n\n"
-                    "[For fun only]"
-                )
-                AICRUSH_RESULT_CACHE[cache_key] = (time.monotonic(), result)
-                await send_chunked(ctx, result)
-                return
-
-            crush_pick_id, crush_reason, crush_ai_conf = await rerank_aicrush_candidates_with_ai(
-                member,
-                target_gender=target_gender,
-                context=context,
-                candidates=crush_pool,
-                direction="crush",
-            )
-            admirer_pick_id, admirer_reason, admirer_ai_conf = await rerank_aicrush_candidates_with_ai(
-                member,
-                target_gender=target_gender,
-                context=context,
-                candidates=admirer_pool,
-                direction="admirer",
-            )
-
-            crush_row = _aicrush_pick_row(crush_pool, crush_pick_id)
-            admirer_row = _aicrush_pick_row(admirer_pool, admirer_pick_id)
-            crush_confidence, crush_band = _aicrush_confidence_from_pool(crush_pool)
-            admirer_confidence, admirer_band = _aicrush_confidence_from_pool(admirer_pool)
-            crush_confidence = max(crush_confidence, crush_ai_conf)
-            admirer_confidence = max(admirer_confidence, admirer_ai_conf)
-
-            crush_member = crush_row.get("member") if isinstance(crush_row, dict) else None
-            admirer_member = admirer_row.get("member") if isinstance(admirer_row, dict) else None
-
-            if isinstance(crush_member, discord.Member):
-                history_key = (ctx.guild.id, member.id)
-                previous = AICRUSH_LAST_MATCHES.get(history_key)
-                cooldown_seconds = AICRUSH_MATCH_COOLDOWN_HOURS * 3600
-                if (
-                    previous is not None
-                    and time.monotonic() - previous[1] < cooldown_seconds
-                    and previous[0] == crush_member.id
-                    and len(crush_pool) > 1
-                ):
-                    alt = crush_pool[1]
-                    alt_member = alt.get("member")
-                    if (
-                        isinstance(alt_member, discord.Member)
-                        and float(alt.get("heuristic_score", 0.0))
-                        >= float(crush_row.get("heuristic_score", 0.0)) * 0.72
-                    ):
-                        crush_row = alt
-                        crush_member = alt_member
-                AICRUSH_LAST_MATCHES[history_key] = (crush_member.id, time.monotonic())
-
-            explanation = await build_aicrush_pair_explanation(
-                member,
-                crush_row=crush_row,
-                admirer_row=admirer_row,
-                context=context,
-                crush_confidence=crush_confidence,
-                admirer_confidence=admirer_confidence,
-            )
-
-    mutual_signal = (
-        isinstance(crush_member, discord.Member)
-        and isinstance(admirer_member, discord.Member)
-        and crush_member.id == admirer_member.id
-    )
-    crush_line = (
-        f"{crush_member.mention} | confidence `{int(crush_confidence * 100)}%` ({crush_band})"
-        if isinstance(crush_member, discord.Member)
-        else f"No clear crush target yet | confidence `{int(crush_confidence * 100)}%` ({crush_band})"
-    )
-    admirer_line = (
-        f"{admirer_member.mention} | confidence `{int(admirer_confidence * 100)}%` ({admirer_band})"
-        if isinstance(admirer_member, discord.Member)
-        else f"No clear admirer yet | confidence `{int(admirer_confidence * 100)}%` ({admirer_band})"
-    )
-    low_data_note = ""
-    low_data_reasons: list[str] = []
-    if context.target_message_count <= 4:
-        low_data_reasons.append("very few target-authored messages")
-    if (
-        context.scan_coverage.get("channels_total", 0) > 0
-        and context.scan_coverage.get("channels_fully_scanned", 0)
-        < context.scan_coverage.get("channels_total", 0)
-    ):
-        low_data_reasons.append("historical backfill still in progress")
-    if low_data_reasons:
-        low_data_note = "\nEvidence note: " + "; ".join(low_data_reasons) + "."
-
-    coverage = context.scan_coverage
-    rationale_lines = []
-    if crush_reason:
-        rationale_lines.append(f"Crush rationale: {crush_reason}")
-    if admirer_reason:
-        rationale_lines.append(f"Admirer rationale: {admirer_reason}")
-    rationale_text = "\n".join(rationale_lines)
-    if rationale_text:
-        rationale_text = f"\n{rationale_text}"
-
-    result = (
-        f"[AI CRUSH] for {member.display_name}\n"
-        f"Likely crush of {member.display_name}: {crush_line}\n"
-        f"Likely admirer of {member.display_name}: {admirer_line}\n"
-        f"Mutual signal: `{'yes' if mutual_signal else 'no'}`\n"
-        f"Why:\n{explanation}{rationale_text}\n"
-        f"Coverage: channels `{coverage.get('channels_fully_scanned', 0)}/{coverage.get('channels_total', 0)}` | "
-        f"indexed msgs `{coverage.get('messages_indexed', 0)}` | "
-        f"target msgs `{context.target_message_count}` | "
-        f"freshly scanned `{backfill_summary.get('scanned_messages', 0)}` in `{backfill_summary.get('passes', 0)}` passes{low_data_note}\n"
-        "Engagement prompt: Reply with the ship-name or call out the plot twist.\n\n"
-        "[For fun only]"
-    )
-    AICRUSH_RESULT_CACHE[cache_key] = (time.monotonic(), result)
-    await send_chunked(ctx, result)
-
-
 @bot.hybrid_command(name="altfinder")
 @commands.cooldown(2, 90, commands.BucketType.user)
 @commands.guild_only()
@@ -21970,6 +20254,8 @@ async def suspectclear_command(ctx: commands.Context, target: discord.Member) ->
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
 async def analyze_command(ctx: commands.Context, member: discord.Member) -> None:
+    if await refuse_fun_excluded(ctx, member):
+        return
     if member.bot:
         await ctx.send("Bot accounts are not supported for analysis.")
         return
@@ -22090,6 +20376,8 @@ async def analyze_command(ctx: commands.Context, member: discord.Member) -> None
 async def lie_detector_command(
     ctx: commands.Context, member: discord.Member, *, statement: str
 ) -> None:
+    if await refuse_fun_excluded(ctx, member):
+        return
     if not await enforce_fun_rate_limit_ctx(ctx):
         return
     if not is_ai_configured():
@@ -22256,6 +20544,8 @@ async def argument_command(ctx: commands.Context, *, topic: str) -> None:
 @commands.cooldown(2, 75, commands.BucketType.user)
 @commands.guild_only()
 async def debate_command(ctx: commands.Context, member: discord.Member, *, topic: str) -> None:
+    if await refuse_fun_excluded(ctx, member):
+        return
     if not await enforce_fun_rate_limit_ctx(ctx):
         return
     if member.bot or member.id == ctx.author.id:
@@ -23117,6 +21407,143 @@ async def agent_command(ctx: commands.Context, *, request: str | None = None) ->
 # block in mod_config.json (see `&agentic`).
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Crush-o-Meter game (phase 4). Replaces the old history-mining aicrush.
+# ---------------------------------------------------------------------------
+
+CRUSH_GAME_STATE = crush_game.CrushGameState()
+GROQ_BUDGET.feature_caps.setdefault(
+    crush_game.FEATURE, env_int("CRUSH_GAME_DAILY_CAP", crush_game.DEFAULT_DAILY_CAP, 1)
+)
+GROQ_BUDGET.feature_caps.setdefault(
+    crush_game.FLAVOR_FEATURE, env_int("CRUSH_GAME_FLAVOR_DAILY_CAP", crush_game.DEFAULT_DAILY_CAP, 1)
+)
+
+
+async def _crush_game_flavor(prompt: str) -> str:
+    # Optional one-line joke. Only on Groq, so it always goes through the budget
+    # governor (with its own per-feature cap); otherwise the game is template-only.
+    if AI_PROVIDER != "groq" or not GROQ_API_KEY:
+        return ""
+    return await request_groq_completion(
+        [
+            {"role": "system", "content": "You write one short, wholesome joke line for a party game."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=80,
+        temperature=0.9,
+        include_fallback_notice=False,
+        feature=crush_game.FLAVOR_FEATURE,
+    )
+
+
+CRUSH_GAME = crush_game.CrushGame(
+    state=CRUSH_GAME_STATE,
+    admit_feature=GROQ_BUDGET.try_admit_feature,
+    prefix=PREFIX,
+    flavor=_crush_game_flavor,
+)
+
+
+def load_crush_game_state() -> None:
+    global CRUSH_GAME_STATE
+    removed = crush_game.purge_legacy_files(
+        [LEGACY_AICRUSH_STATE_FILE, _json_backup_path(LEGACY_AICRUSH_STATE_FILE)]
+    )
+    if removed:
+        print(f"[CRUSH GAME] Deleted legacy aicrush history data: {', '.join(removed)}")
+    CRUSH_GAME_STATE = crush_game.CrushGameState(read_json(CRUSH_GAME_STATE_FILE))
+    CRUSH_GAME.state = CRUSH_GAME_STATE
+
+
+def save_crush_game_state(force: bool = False) -> None:
+    if (force or CRUSH_GAME_STATE.dirty) and write_json(CRUSH_GAME_STATE_FILE, CRUSH_GAME_STATE.data):
+        CRUSH_GAME_STATE.dirty = False
+
+
+async def refuse_fun_excluded(ctx: commands.Context, member: Any) -> bool:
+    """True (and a reply sent) if ``member`` used &exclude; fun features must skip them."""
+    if ctx.guild is None or member is None:
+        return False
+    if CRUSH_GAME.is_excluded(ctx.guild.id, member.id):
+        await ctx.send(CRUSH_GAME.excluded_text())
+        return True
+    return False
+
+
+@bot.hybrid_command(name="crush")
+@commands.cooldown(3, 60, commands.BucketType.user)
+@commands.guild_only()
+async def crush_command(
+    ctx: commands.Context, member: discord.Member | None = None, *, answer: str = ""
+) -> None:
+    """Crush-o-Meter joke game about you. Naming a member is only a random pairing."""
+    if member is not None and getattr(member, "bot", False):
+        await ctx.send("Bots are too busy beeping to play the Crush-o-Meter. 🤖")
+        return
+    # Inputs are only what the invoker deliberately gives the game: their answer,
+    # or one of their OWN messages they reply to. Nobody else's messages are read.
+    supplied = answer
+    reference = getattr(ctx.message, "reference", None) if ctx.message is not None else None
+    resolved = getattr(reference, "resolved", None)
+    if not supplied and isinstance(resolved, discord.Message):
+        supplied = crush_game.pointed_input(ctx.author.id, resolved.author.id, resolved.content)
+    result = await CRUSH_GAME.play(ctx.guild, ctx.author, member, answer=supplied)
+    save_crush_game_state()
+    await ctx.send(result, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.command(name="crushgame")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def crush_game_admin_command(
+    ctx: commands.Context, mode: str = "status", channel: discord.TextChannel | None = None
+) -> None:
+    mode = (mode or "status").strip().lower()
+    if mode in {"on", "enable"}:
+        target_channel = channel or ctx.channel
+        posted = await CRUSH_GAME.enable(ctx.guild.id, target_channel)
+        save_crush_game_state(force=True)
+        note = f" Notice posted in {target_channel.mention}." if posted else " (The one-time notice was already posted.)"
+        await ctx.send(f"Crush-o-Meter game enabled.{note}")
+    elif mode in {"off", "disable"}:
+        CRUSH_GAME.disable(ctx.guild.id)
+        save_crush_game_state(force=True)
+        await ctx.send("Crush-o-Meter game disabled.")
+    else:
+        state = "on" if CRUSH_GAME.is_enabled(ctx.guild.id) else "off"
+        await ctx.send(f"Crush-o-Meter game is **{state}**. Use `{PREFIX}crushgame on [#channel]` or `off`.")
+
+
+@bot.command(name="exclude")
+@commands.guild_only()
+async def exclude_command(ctx: commands.Context) -> None:
+    CRUSH_GAME.exclude(ctx.guild.id, ctx.author.id)
+    save_crush_game_state(force=True)
+    await ctx.send(
+        "Done. You're excluded from fun features: you will never be analyzed or named in a game "
+        f"result, and your stored fun-feature data was deleted. Changed your mind? `{PREFIX}include`."
+    )
+
+
+@bot.command(name="include")
+@commands.guild_only()
+async def include_command(ctx: commands.Context) -> None:
+    CRUSH_GAME.include(ctx.guild.id, ctx.author.id)
+    save_crush_game_state(force=True)
+    await ctx.send("You're back in the fun features. 🎉")
+
+
+@bot.command(name="wipe")
+@commands.guild_only()
+async def wipe_command(ctx: commands.Context) -> None:
+    CRUSH_GAME.wipe(ctx.guild.id, ctx.author.id)
+    save_crush_game_state(force=True)
+    await ctx.send(
+        f"Your stored fun-feature data was deleted. To also opt out of fun features, use `{PREFIX}exclude`."
+    )
+
+
 AGENTIC_STATE_FILE = DATA_DIR / "agentic_state.json"
 AGENTIC_STATE = agentic_automation.AgenticState()
 AGENTIC_RECENT_CASES: dict[tuple[int, int], deque[str]] = defaultdict(lambda: deque(maxlen=10))
@@ -23499,7 +21926,7 @@ def main() -> None:
     reload_bad_words()
     load_ai_mod_state()
     load_engagement_state()
-    load_aicrush_state()
+    load_crush_game_state()
     load_altfinder_state()
     load_socialintel_state()
     load_business_state()
