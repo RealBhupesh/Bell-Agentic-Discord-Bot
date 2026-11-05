@@ -300,14 +300,35 @@ class JsonFileBackend(StorageBackend):
             return None
         return payload if isinstance(payload, dict) else None
 
-    def _log_persistence_error(self, path: Path, action: str, error: OSError) -> None:
+    def _should_log(self, key: str) -> bool:
+        """Rate-limit repeats of ``key``; the first occurrence is always logged.
+
+        (A missing key must not be treated as "logged at t=0": on a freshly
+        booted host ``time.monotonic()`` can be below the interval.)
+        """
         now = time.monotonic()
-        key = f"{action}:{path}:{getattr(error, 'errno', 'unknown')}"
-        if now - self._error_last_ts.get(key, 0.0) < self.ERROR_LOG_INTERVAL:
-            return
+        last = self._error_last_ts.get(key)
+        if last is not None and now - last < self.ERROR_LOG_INTERVAL:
+            return False
         self._error_last_ts[key] = now
+        return True
+
+    def _log_persistence_error(self, path: Path, action: str, error: OSError) -> None:
+        key = f"{action}:{path}:{getattr(error, 'errno', 'unknown')}"
+        if not self._should_log(key):
+            return
         self._log(
             f"[PERSISTENCE ERROR] action={action} path=`{path}` "
+            f"errno=`{getattr(error, 'errno', 'unknown')}` detail=`{error}`"
+        )
+
+    def _log_atomic_fallback(self, path: Path, error: OSError) -> None:
+        """Warn that a write lost its atomicity (durability degradation)."""
+        key = f"atomic_replace:{path}:{getattr(error, 'errno', 'unknown')}"
+        if not self._should_log(key):
+            return
+        self._log(
+            f"[PERSISTENCE WARNING] atomic_replace failed, falling back to direct write: path=`{path}` "
             f"errno=`{getattr(error, 'errno', 'unknown')}` detail=`{error}`"
         )
 
@@ -320,7 +341,7 @@ class JsonFileBackend(StorageBackend):
             os.replace(temp_path, path)
             return True, None
         except OSError as error:
-            self._log_persistence_error(path, "atomic_replace", error)
+            self._log_atomic_fallback(path, error)
             try:
                 path.write_text(text, encoding="utf-8")
                 try:
