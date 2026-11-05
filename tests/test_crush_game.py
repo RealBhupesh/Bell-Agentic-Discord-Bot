@@ -31,7 +31,7 @@ def bot_source() -> str:
 def crush_section() -> str:
     source = bot_source()
     start = source.index("# Crush-o-Meter game (phase 4)")
-    end = source.index('AGENTIC_STATE_FILE = DATA_DIR / "agentic_state.json"')
+    end = source.index("AGENTIC_STATE = agentic_automation.AgenticState()")
     return source[start:end]
 
 

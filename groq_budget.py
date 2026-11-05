@@ -20,16 +20,17 @@ coroutine that performs the actual request for one model.
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import os
-import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
+
+import storage
+from storage import atomic_write_json  # noqa: F401 - re-exported for existing callers
 
 # ---------------------------------------------------------------------------
 # Model configuration
@@ -355,6 +356,8 @@ class GroqBudgetGovernor:
         allow_enterprise_models: bool = False,
         state_path: str | os.PathLike[str] | None = None,
         wall_clock: Callable[[], float] = time.time,
+        storage_backend: storage.StorageBackend | None = None,
+        storage_key: str = "groq_budget",
     ) -> None:
         self.default_limits = default_limits
         self.model_limits = builtin_model_limits(default_limits)
@@ -375,8 +378,16 @@ class GroqBudgetGovernor:
         self._circuit_daily = False
         self.allow_enterprise_models = bool(allow_enterprise_models)
         self._wall_clock = wall_clock
+        # Counters persist through the storage adapter. ``state_path`` alone keeps the
+        # original behaviour: a single-process JSON file at that path.
         self.state_path = Path(state_path) if state_path else None
-        if self.state_path is not None:
+        if storage_backend is None and self.state_path is not None:
+            storage_backend = storage.JsonFileBackend(
+                self.state_path.parent, paths={storage_key: self.state_path}
+            )
+        self.storage = storage_backend
+        self.storage_key = storage_key
+        if self.storage is not None:
             self._load_state()
 
     # -- construction -----------------------------------------------------
@@ -451,7 +462,7 @@ class GroqBudgetGovernor:
             return 0
         return usage.used
 
-    def _admit_feature(self, feature: str) -> None:
+    def _admit_feature_now(self, feature: str) -> None:
         cap = self._feature_cap(feature)
         today = self._day_key()
         usage = self._features.setdefault(feature, _FeatureUsage())
@@ -461,7 +472,9 @@ class GroqBudgetGovernor:
         if cap > 0 and usage.used >= cap:
             raise FeatureCapExceededError(feature)
         usage.used += 1
-        self._save_state()
+
+    def _admit_feature(self, feature: str) -> None:
+        self._mutate(lambda: self._admit_feature_now(feature))
 
     def try_admit_feature(self, feature: str) -> bool:
         """Count one use of ``feature`` against its daily cap without a model call.
@@ -477,9 +490,16 @@ class GroqBudgetGovernor:
         return True
 
     def _refund_feature(self, feature: str) -> None:
-        usage = self._features.get(feature)
-        if usage is not None and usage.day == self._day_key() and usage.used > 0:
-            usage.used -= 1
+        def refund() -> bool:
+            usage = self._features.get(feature)
+            if usage is not None and usage.day == self._day_key() and usage.used > 0:
+                usage.used -= 1
+                return True
+            return False
+
+        if self.shared:
+            self._mutate(refund)
+        elif refund():
             self._save_state()
 
     # -- FIFO queue -------------------------------------------------------
@@ -521,14 +541,14 @@ class GroqBudgetGovernor:
         """
         await self._acquire_turn()
         try:
+            self._refresh()
             state = self._state(model)
             wait = state.wait_time(tokens, self._clock())
             if wait > self.max_wait_seconds:
                 return False
             if wait > 0:
                 await self._sleep(wait)
-            state.reserve(tokens, self._clock())
-            self._save_state()
+            self._mutate(lambda: self._state(model).reserve(tokens, self._clock()))
             return True
         finally:
             self._release_turn()
@@ -536,6 +556,9 @@ class GroqBudgetGovernor:
     # -- 429 handling -----------------------------------------------------
 
     def _penalize(self, model: str, error: ModelRateLimited) -> None:
+        self._mutate(lambda: self._penalize_now(model, error))
+
+    def _penalize_now(self, model: str, error: ModelRateLimited) -> None:
         now = self._clock()
         state = self._state(model)
         retry_after = error.retry_after if error.retry_after and error.retry_after > 0 else self.default_retry_after
@@ -545,7 +568,6 @@ class GroqBudgetGovernor:
             state.tpd.drain(now)
         # Groq's own window is authoritative: our minute view was too optimistic.
         state.rpm.drain(now)
-        self._save_state()
 
     def _daily_exhausted(self, state: _ModelState, tokens: int, now: float) -> bool:
         return (
@@ -560,19 +582,25 @@ class GroqBudgetGovernor:
 
     def _open_circuit(self, models: list[str], tokens: int) -> GroqBudgetError:
         """Every model is out of budget: fail fast until the first one recovers."""
-        now = self._clock()
-        states = [self._state(model) for model in models]
-        waits = [state.wait_time(tokens, now) for state in states]
-        self._circuit_open_until = now + (min(waits) if waits else self.default_retry_after)
-        self._circuit_daily = all(self._daily_exhausted(state, tokens, now) for state in states)
-        self._save_state()
+
+        def open_now() -> None:
+            now = self._clock()
+            states = [self._state(model) for model in models]
+            waits = [state.wait_time(tokens, now) for state in states]
+            self._circuit_open_until = now + (min(waits) if waits else self.default_retry_after)
+            self._circuit_daily = all(self._daily_exhausted(state, tokens, now) for state in states)
+
+        self._mutate(open_now)
         return self._circuit_error()
 
     # -- durable counters -------------------------------------------------
     #
     # Bucket timestamps are monotonic-clock values, which do not survive a
     # restart, so they are stored as wall-clock times and converted back on
-    # load. A single bot process is assumed to own the file.
+    # load. With the default JSON file backend a single bot process is assumed
+    # to own the file. With a shared backend (PostgresBackend, DATABASE_URL)
+    # every mutation re-reads the stored counters and writes them back inside
+    # one locked read-modify-write, so several processes share one budget.
 
     STATE_VERSION = 1
 
@@ -667,24 +695,56 @@ class GroqBudgetGovernor:
                 self._circuit_open_until = mono_now + (open_until - wall_now)
                 self._circuit_daily = bool(circuit.get("daily", False))
 
+    @property
+    def shared(self) -> bool:
+        return bool(self.storage is not None and self.storage.shared)
+
     def _load_state(self) -> None:
-        path = self.state_path
-        if path is None or not path.exists():
+        if self.storage is None:
             return
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            print(f"[GROQ BUDGET] Ignoring unreadable state file `{path}`: {error}")
+            payload = self.storage.get(self.storage_key)
+        except Exception as error:  # noqa: BLE001 - never let storage break AI calls
+            print(f"[GROQ BUDGET] Could not load counters: {type(error).__name__}: {error}")
             return
-        self.import_state(payload)
+        if payload is not None:
+            self.import_state(payload)
 
     def _save_state(self) -> None:
-        if self.state_path is None:
+        if self.storage is None:
             return
         try:
-            atomic_write_json(self.state_path, self.export_state())
-        except OSError as error:
-            print(f"[GROQ BUDGET] Could not save state file `{self.state_path}`: {error}")
+            self.storage.set(self.storage_key, self.export_state())
+        except Exception as error:  # noqa: BLE001
+            print(f"[GROQ BUDGET] Could not save counters: {type(error).__name__}: {error}")
+
+    def _refresh(self) -> None:
+        """Pick up counters written by other processes (shared backends only)."""
+        if self.shared:
+            self._load_state()
+
+    def _mutate(self, fn: Callable[[], Any]) -> Any:
+        """Apply ``fn`` to the counters and persist them.
+
+        Single-process backends: run ``fn`` then save (the original behaviour).
+        Shared backends: one atomic ``update`` - load the latest stored
+        counters, apply ``fn``, store the result - so concurrent processes never
+        lose each other's increments. If ``fn`` raises, nothing is written.
+        """
+        if not self.shared:
+            result = fn()
+            self._save_state()
+            return result
+        box: dict[str, Any] = {}
+
+        def apply(current: dict | None) -> dict:
+            if current is not None:
+                self.import_state(current)
+            box["result"] = fn()
+            return self.export_state()
+
+        self.storage.update(self.storage_key, apply)
+        return box.get("result")
 
     # -- main entry point -------------------------------------------------
 
@@ -716,6 +776,7 @@ class GroqBudgetGovernor:
                 f"{ALLOW_ENTERPRISE_ENV}=1)."
             )
 
+        self._refresh()
         if self.circuit_open():
             raise self._circuit_error()
 
@@ -749,36 +810,21 @@ class GroqBudgetGovernor:
                 last_error = error
                 continue
             if used is not None and used > 0:
-                state = self._state(model)
-                now = self._clock()
                 delta = int(used) - tokens
-                state.tpm.adjust(delta, now)
-                state.tpd.adjust(delta, now)
-                self._save_state()
+
+                def settle() -> None:
+                    state = self._state(model)
+                    now = self._clock()
+                    state.tpm.adjust(delta, now)
+                    state.tpd.adjust(delta, now)
+
+                self._mutate(settle)
             return model, value
 
         if budget_blocked == len(ordered):
             raise self._open_circuit(ordered, tokens)
         raise RuntimeError(str(last_error) if last_error else "Groq request failed.")
 
-
-def atomic_write_json(path: str | os.PathLike[str], payload: Any) -> None:
-    """Write JSON so readers only ever see the old or the new complete file."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, target)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
 
 
 def parse_retry_after(value: str | None) -> float | None:

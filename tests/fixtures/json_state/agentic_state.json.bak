@@ -1,0 +1,14 @@
+{
+  "guilds": {
+    "111111111111111111": {
+      "scheduled": {
+        "T1": {
+          "cron": "0 9 * * 1",
+          "prompt": "weekly recap",
+          "last_run": 1793000000.0
+        }
+      },
+      "proposals": {}
+    }
+  }
+}

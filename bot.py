@@ -28,6 +28,7 @@ import agent_tools
 import agentic_automation
 import crush_game
 import groq_budget
+import storage
 
 try:
     import yt_dlp
@@ -328,20 +329,23 @@ intents.presences = DISCORD_ENABLE_PRESENCE_INTENT
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 DATA_DIR = Path("data")
-WARNINGS_FILE = DATA_DIR / "warnings.json"
-MOD_CONFIG_FILE = DATA_DIR / "mod_config.json"
-AI_MOD_STATE_FILE = DATA_DIR / "ai_mod_state.json"
-CAPABILITIES_OVERRIDES_FILE = DATA_DIR / "capabilities_overrides.json"
-CAPABILITIES_CATALOG_FILE = DATA_DIR / "capabilities_catalog.json"
+# Every JSON state document goes through the storage adapter (storage.py); these
+# are its keys. File names and formats on disk are listed in storage.AREAS.
+WARNINGS_KEY = "warnings"
+MOD_CONFIG_KEY = "guild_settings"
+AI_MOD_STATE_KEY = "mod_log"
+CAPABILITIES_OVERRIDES_KEY = "capabilities_overrides"
+CAPABILITIES_CATALOG_KEY = "capabilities_catalog"
 BAD_WORDS_FILE = DATA_DIR / "bad_words.txt"
-ENGAGEMENT_STATE_FILE = DATA_DIR / "engagement_state.json"
-BUSINESS_STATE_FILE = DATA_DIR / "business_state.json"
+ENGAGEMENT_STATE_KEY = "engagement"
+BUSINESS_STATE_KEY = "economy"
 # Legacy data from the removed history-mining aicrush feature; deleted at startup.
-LEGACY_AICRUSH_STATE_FILE = DATA_DIR / "aicrush_state.json"
-CRUSH_GAME_STATE_FILE = DATA_DIR / "crush_game.json"
-ALTFINDER_STATE_FILE = DATA_DIR / "altfinder_state.json"
-SOCIALINTEL_STATE_FILE = DATA_DIR / "socialintel_state.json"
-PERSISTENCE_ERROR_LAST_TS: dict[str, float] = {}
+LEGACY_AICRUSH_STATE_KEY = "legacy_aicrush"
+CRUSH_GAME_STATE_KEY = "crush_game"
+ALTFINDER_STATE_KEY = "altfinder"
+SOCIALINTEL_STATE_KEY = "socialintel"
+AGENTIC_STATE_KEY = "agentic_state"
+GROQ_BUDGET_STATE_KEY = "groq_budget"
 
 LINK_PATTERN = re.compile(r"(https?://|www\.|discord\.gg/)", re.IGNORECASE)
 WORD_PATTERN = re.compile(r"\b[\w']+\b")
@@ -407,9 +411,17 @@ AI_CIRCUIT_OPEN_UNTIL: dict[str, float] = {}
 GROQ_BUDGET_STATE_FILE = Path(
     os.getenv("GROQ_BUDGET_STATE_FILE", "").strip() or str(DATA_DIR / "groq_budget_state.json")
 )
-# Usage counters survive restarts; one bot process is assumed to own this file.
+# JSON files under data/ by default; PostgreSQL only when DATABASE_URL is set.
+STORAGE = storage.backend_from_env(
+    os.environ, data_dir=DATA_DIR, paths={GROQ_BUDGET_STATE_KEY: GROQ_BUDGET_STATE_FILE}
+)
+# Usage counters survive restarts. With the JSON backend one bot process is assumed
+# to own the counters; a shared backend (DATABASE_URL) makes them multi-process safe.
 GROQ_BUDGET = groq_budget.GroqBudgetGovernor.from_env(
-    os.environ, state_path=GROQ_BUDGET_STATE_FILE
+    os.environ,
+    state_path=GROQ_BUDGET_STATE_FILE,
+    storage_backend=STORAGE,
+    storage_key=GROQ_BUDGET_STATE_KEY,
 )
 AI_MOD_STATE: dict[str, Any] = {}
 AI_MOD_STATE_DIRTY = False
@@ -1029,159 +1041,60 @@ def _sanitize_capabilities_overrides_payload(payload: Any) -> dict[str, Any]:
     return result
 
 
-def _safe_file_mtime(path: Path) -> float:
-    try:
-        return float(path.stat().st_mtime)
-    except OSError:
-        return 0.0
-
-
-def _clone_json_dict(payload: dict) -> dict:
-    try:
-        cloned = json.loads(json.dumps(payload))
-    except (TypeError, ValueError):
-        cloned = dict(payload)
-    return cloned if isinstance(cloned, dict) else {}
-
-
-def _json_backup_path(path: Path) -> Path:
-    return path.with_suffix(f"{path.suffix}.bak")
-
-
-def _read_json_file(path: Path) -> dict:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _log_persistence_error(path: Path, action: str, error: OSError) -> None:
-    now = time.monotonic()
-    key = f"{action}:{path}:{getattr(error, 'errno', 'unknown')}"
-    last_ts = PERSISTENCE_ERROR_LAST_TS.get(key, 0.0)
-    if now - last_ts < 25.0:
-        return
-    PERSISTENCE_ERROR_LAST_TS[key] = now
-    print(
-        f"[PERSISTENCE ERROR] action={action} path=`{path}` "
-        f"errno=`{getattr(error, 'errno', 'unknown')}` detail=`{error}`"
-    )
-
-
-def _write_text_atomic(path: Path, text: str) -> tuple[bool, OSError | None]:
-    temp_name = f"{path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
-    temp_path = path.with_name(temp_name)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_text(text, encoding="utf-8")
-        os.replace(temp_path, path)
-        return True, None
-    except OSError as error:
-        _log_persistence_error(path, "atomic_replace", error)
-        # Fallback for platforms/filesystems where atomic replace can fail.
-        try:
-            path.write_text(text, encoding="utf-8")
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except OSError:
-                pass
-            return True, None
-        except OSError as fallback_error:
-            _log_persistence_error(path, "direct_write", fallback_error)
-            error = fallback_error
-        try:
-            if temp_path.exists():
-                temp_path.unlink()
-        except OSError as cleanup_error:
-            _log_persistence_error(path, "temp_cleanup", cleanup_error)
-            pass
-        return False, error
+_STORAGE_SEEDED = False
+_SEEDED_KEYS = (
+    WARNINGS_KEY,
+    MOD_CONFIG_KEY,
+    AI_MOD_STATE_KEY,
+    ENGAGEMENT_STATE_KEY,
+    BUSINESS_STATE_KEY,
+    ALTFINDER_STATE_KEY,
+    SOCIALINTEL_STATE_KEY,
+)
 
 
 def ensure_data_files() -> None:
+    global _STORAGE_SEEDED
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not WARNINGS_FILE.exists():
-        WARNINGS_FILE.write_text("{}", encoding="utf-8")
-    if not MOD_CONFIG_FILE.exists():
-        MOD_CONFIG_FILE.write_text("{}", encoding="utf-8")
-    if not AI_MOD_STATE_FILE.exists():
-        AI_MOD_STATE_FILE.write_text("{}", encoding="utf-8")
-    if not CAPABILITIES_OVERRIDES_FILE.exists():
-        CAPABILITIES_OVERRIDES_FILE.write_text(
-            json.dumps(_default_capabilities_overrides_payload(), indent=2),
-            encoding="utf-8",
-        )
-    if not CAPABILITIES_CATALOG_FILE.exists():
-        CAPABILITIES_CATALOG_FILE.write_text(
-            json.dumps(_default_capabilities_catalog_payload(), indent=2),
-            encoding="utf-8",
-        )
     if not BAD_WORDS_FILE.exists():
         BAD_WORDS_FILE.write_text(
             "# Add one blocked word per line.\n# Lines starting with # are ignored.\n",
             encoding="utf-8",
         )
-    if not ENGAGEMENT_STATE_FILE.exists():
-        ENGAGEMENT_STATE_FILE.write_text('{"guilds": {}}', encoding="utf-8")
-    if not BUSINESS_STATE_FILE.exists():
-        BUSINESS_STATE_FILE.write_text("{}", encoding="utf-8")
-    if not ALTFINDER_STATE_FILE.exists():
-        ALTFINDER_STATE_FILE.write_text('{"schema_version": 1, "guilds": {}}', encoding="utf-8")
-    if not SOCIALINTEL_STATE_FILE.exists():
-        SOCIALINTEL_STATE_FILE.write_text('{"schema_version": 1, "guilds": {}}', encoding="utf-8")
+    # JSON files are re-seeded on every access (as before, so a deleted file comes
+    # back); a shared database backend is seeded once per process.
+    if STORAGE.shared and _STORAGE_SEEDED:
+        return
+    for key in _SEEDED_KEYS[:3]:
+        STORAGE.ensure_default(key)
+    if not STORAGE.exists(CAPABILITIES_OVERRIDES_KEY):
+        STORAGE.ensure_default(CAPABILITIES_OVERRIDES_KEY, _default_capabilities_overrides_payload())
+    if not STORAGE.exists(CAPABILITIES_CATALOG_KEY):
+        STORAGE.ensure_default(CAPABILITIES_CATALOG_KEY, _default_capabilities_catalog_payload())
+    for key in _SEEDED_KEYS[3:]:
+        STORAGE.ensure_default(key)
+    _STORAGE_SEEDED = True
 
 
-def read_json(path: Path) -> dict:
+def read_state(key: str) -> dict:
+    """The stored document for ``key`` (``{}`` when missing, empty or unreadable)."""
     ensure_data_files()
-    payload = _read_json_file(path)
-    if payload:
-        return payload
-    backup_payload = _read_json_file(_json_backup_path(path))
-    if backup_payload:
-        return backup_payload
-    return {}
+    return STORAGE.get(key) or {}
 
 
-def write_json(path: Path, payload: dict) -> bool:
-    cloned = _clone_json_dict(payload)
-
+def write_state(key: str, payload: dict) -> bool:
+    """Persist ``payload`` under ``key``; False if it could not be saved (already logged)."""
+    cloned = storage.clone_json_dict(payload)
     ensure_data_files()
-    try:
-        serialized = json.dumps(cloned, indent=2)
-    except (TypeError, ValueError):
-        print(f"[JSON SERIALIZE ERROR] Could not serialize payload for `{path}`.")
-        return False
-    ok, primary_error = _write_text_atomic(path, serialized)
-    if not ok:
-        if primary_error is not None:
-            print(
-                f"[JSON WRITE ERROR] Could not write `{path}` "
-                f"(errno={getattr(primary_error, 'errno', 'unknown')}: {primary_error})."
-            )
-        else:
-            print(f"[JSON WRITE ERROR] Could not write `{path}`.")
-        return False
-    backup_path = _json_backup_path(path)
-    backup_ok, backup_error = _write_text_atomic(backup_path, serialized)
-    if not backup_ok:
-        if backup_error is not None:
-            print(
-                f"[JSON BACKUP WRITE ERROR] Could not write `{backup_path}` "
-                f"(errno={getattr(backup_error, 'errno', 'unknown')}: {backup_error})."
-            )
-        else:
-            print(f"[JSON BACKUP WRITE ERROR] Could not write `{backup_path}`.")
-    return True
+    return STORAGE.set(key, cloned)
 
 
 def load_warnings() -> dict:
-    return read_json(WARNINGS_FILE)
+    return read_state(WARNINGS_KEY)
 
 
 def save_warnings(payload: dict) -> None:
-    write_json(WARNINGS_FILE, payload)
+    write_state(WARNINGS_KEY, payload)
 
 
 MOD_CONFIG_CACHE: dict | None = None
@@ -1194,7 +1107,7 @@ def load_mod_config() -> dict:
     now = time.monotonic()
     if MOD_CONFIG_CACHE is not None and now - MOD_CONFIG_CACHE_TS < MOD_CONFIG_CACHE_TTL_SECONDS:
         return MOD_CONFIG_CACHE
-    config = read_json(MOD_CONFIG_FILE)
+    config = read_state(MOD_CONFIG_KEY)
     MOD_CONFIG_CACHE = config
     MOD_CONFIG_CACHE_TS = now
     return config
@@ -1202,7 +1115,7 @@ def load_mod_config() -> dict:
 
 def save_mod_config(payload: dict) -> None:
     global MOD_CONFIG_CACHE, MOD_CONFIG_CACHE_TS
-    write_json(MOD_CONFIG_FILE, payload)
+    write_state(MOD_CONFIG_KEY, payload)
     MOD_CONFIG_CACHE = payload
     MOD_CONFIG_CACHE_TS = time.monotonic()
 
@@ -1258,7 +1171,7 @@ def _sanitize_ai_mod_state(payload: Any) -> dict[str, Any]:
 
 def load_ai_mod_state() -> None:
     global AI_MOD_STATE, AI_MOD_STATE_DIRTY
-    payload = read_json(AI_MOD_STATE_FILE)
+    payload = read_state(AI_MOD_STATE_KEY)
     AI_MOD_STATE = _sanitize_ai_mod_state(payload)
     AI_MOD_STATE_DIRTY = False
 
@@ -1285,7 +1198,7 @@ async def flush_ai_mod_state(force: bool = False) -> None:
         if not force and not AI_MOD_STATE_DIRTY:
             return
         try:
-            persisted = write_json(AI_MOD_STATE_FILE, AI_MOD_STATE)
+            persisted = write_state(AI_MOD_STATE_KEY, AI_MOD_STATE)
             if persisted:
                 AI_MOD_STATE_DIRTY = False
         except Exception:
@@ -3334,7 +3247,7 @@ def _default_user_engagement_state() -> dict[str, object]:
 
 def load_engagement_state() -> None:
     global ENGAGEMENT_STATE, ENGAGEMENT_STATE_DIRTY
-    payload = read_json(ENGAGEMENT_STATE_FILE)
+    payload = read_state(ENGAGEMENT_STATE_KEY)
     if not payload:
         payload = {"guilds": {}}
     if not isinstance(payload, dict):
@@ -3359,7 +3272,7 @@ async def flush_engagement_state(force: bool = False) -> None:
         if not force and not ENGAGEMENT_STATE_DIRTY:
             return
         try:
-            persisted = write_json(ENGAGEMENT_STATE_FILE, ENGAGEMENT_STATE)
+            persisted = write_state(ENGAGEMENT_STATE_KEY, ENGAGEMENT_STATE)
             if persisted:
                 ENGAGEMENT_STATE_DIRTY = False
         except Exception:
@@ -3414,7 +3327,7 @@ def _sanitize_altfinder_state(payload: Any) -> dict[str, Any]:
 
 def load_altfinder_state() -> None:
     global ALTFINDER_STATE, ALTFINDER_STATE_DIRTY
-    payload = read_json(ALTFINDER_STATE_FILE)
+    payload = read_state(ALTFINDER_STATE_KEY)
     if not payload:
         payload = _default_altfinder_state()
     ALTFINDER_STATE = _sanitize_altfinder_state(payload)
@@ -3443,7 +3356,7 @@ async def flush_altfinder_state(force: bool = False) -> None:
         if not force and not ALTFINDER_STATE_DIRTY:
             return
         try:
-            persisted = write_json(ALTFINDER_STATE_FILE, ALTFINDER_STATE)
+            persisted = write_state(ALTFINDER_STATE_KEY, ALTFINDER_STATE)
             if persisted:
                 ALTFINDER_STATE_DIRTY = False
         except Exception:
@@ -3546,7 +3459,7 @@ def _sanitize_socialintel_state(payload: Any) -> dict[str, Any]:
 
 def load_socialintel_state() -> None:
     global SOCIALINTEL_STATE, SOCIALINTEL_STATE_DIRTY
-    payload = read_json(SOCIALINTEL_STATE_FILE)
+    payload = read_state(SOCIALINTEL_STATE_KEY)
     if not payload:
         payload = _default_socialintel_state()
     SOCIALINTEL_STATE = _sanitize_socialintel_state(payload)
@@ -3575,7 +3488,7 @@ async def flush_socialintel_state(force: bool = False) -> None:
         if not force and not SOCIALINTEL_STATE_DIRTY:
             return
         try:
-            persisted = write_json(SOCIALINTEL_STATE_FILE, SOCIALINTEL_STATE)
+            persisted = write_state(SOCIALINTEL_STATE_KEY, SOCIALINTEL_STATE)
             if persisted:
                 SOCIALINTEL_STATE_DIRTY = False
         except Exception:
@@ -9636,7 +9549,7 @@ def _sanitize_business_state(payload: Any) -> dict[str, Any]:
 
 def load_business_state() -> None:
     global BUSINESS_STATE, BUSINESS_STATE_DIRTY
-    payload = read_json(BUSINESS_STATE_FILE)
+    payload = read_state(BUSINESS_STATE_KEY)
     BUSINESS_STATE = _sanitize_business_state(payload)
     BUSINESS_STATE_DIRTY = False
 
@@ -9654,7 +9567,7 @@ async def flush_business_state(force: bool = False) -> None:
         if not force and not BUSINESS_STATE_DIRTY:
             return
         try:
-            persisted = write_json(BUSINESS_STATE_FILE, BUSINESS_STATE)
+            persisted = write_state(BUSINESS_STATE_KEY, BUSINESS_STATE)
             if persisted:
                 BUSINESS_STATE_DIRTY = False
         except Exception:
@@ -11968,7 +11881,7 @@ def load_capabilities_overrides(*, force: bool = False) -> dict[str, Any]:
     global CAPABILITIES_OVERRIDES_CACHE_MTIME
     ensure_data_files()
     now = time.monotonic()
-    mtime = _safe_file_mtime(CAPABILITIES_OVERRIDES_FILE)
+    mtime = STORAGE.version(CAPABILITIES_OVERRIDES_KEY)
     mtime_unchanged = abs(mtime - CAPABILITIES_OVERRIDES_CACHE_MTIME) < 1e-6
     if (
         not force
@@ -11977,19 +11890,15 @@ def load_capabilities_overrides(*, force: bool = False) -> dict[str, Any]:
         and (now - CAPABILITIES_OVERRIDES_CACHE_TS) < CAPABILITIES_CACHE_TTL_SECONDS
     ):
         return CAPABILITIES_OVERRIDES_CACHE
-    try:
-        raw = json.loads(CAPABILITIES_OVERRIDES_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as error:
-        print(f"[CAPABILITY OVERRIDES LOAD ERROR] {error}")
+    raw = STORAGE.get(CAPABILITIES_OVERRIDES_KEY)
+    if raw is None:
+        print("[CAPABILITY OVERRIDES LOAD ERROR] stored overrides are missing or unreadable; using defaults")
         raw = _default_capabilities_overrides_payload()
-        try:
-            CAPABILITIES_OVERRIDES_FILE.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        STORAGE.set(CAPABILITIES_OVERRIDES_KEY, raw)
     payload = _sanitize_capabilities_overrides_payload(raw)
     CAPABILITIES_OVERRIDES_CACHE = payload
     CAPABILITIES_OVERRIDES_CACHE_TS = now
-    CAPABILITIES_OVERRIDES_CACHE_MTIME = _safe_file_mtime(CAPABILITIES_OVERRIDES_FILE)
+    CAPABILITIES_OVERRIDES_CACHE_MTIME = STORAGE.version(CAPABILITIES_OVERRIDES_KEY)
     return payload
 
 
@@ -12231,13 +12140,11 @@ def rebuild_capabilities_catalog(*, force_overrides_reload: bool = False) -> dic
                 "system_capabilities": system_caps,
             }
         )
-        try:
-            CAPABILITIES_CATALOG_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except OSError as error:
-            print(f"[CAPABILITY CATALOG WRITE ERROR] {error}")
+        if not STORAGE.set(CAPABILITIES_CATALOG_KEY, payload):
+            print("[CAPABILITY CATALOG WRITE ERROR] could not persist the rebuilt catalog")
         CAPABILITIES_CATALOG_CACHE = payload
         CAPABILITIES_CATALOG_CACHE_TS = time.monotonic()
-        CAPABILITIES_CATALOG_CACHE_MTIME = _safe_file_mtime(CAPABILITIES_CATALOG_FILE)
+        CAPABILITIES_CATALOG_CACHE_MTIME = STORAGE.version(CAPABILITIES_CATALOG_KEY)
         return payload
     except Exception as error:
         print(f"[CAPABILITY CATALOG REBUILD ERROR] {error}")
@@ -12253,7 +12160,7 @@ def get_capabilities_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
     global CAPABILITIES_CATALOG_CACHE_MTIME
     ensure_data_files()
     now = time.monotonic()
-    mtime = _safe_file_mtime(CAPABILITIES_CATALOG_FILE)
+    mtime = STORAGE.version(CAPABILITIES_CATALOG_KEY)
     mtime_unchanged = abs(mtime - CAPABILITIES_CATALOG_CACHE_MTIME) < 1e-6
     cache_fresh = (
         CAPABILITIES_CATALOG_CACHE is not None
@@ -12263,7 +12170,7 @@ def get_capabilities_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
     if not force_refresh and cache_fresh:
         return CAPABILITIES_CATALOG_CACHE
 
-    overrides_mtime = _safe_file_mtime(CAPABILITIES_OVERRIDES_FILE)
+    overrides_mtime = STORAGE.version(CAPABILITIES_OVERRIDES_KEY)
     should_rebuild = (
         force_refresh
         or CAPABILITIES_CATALOG_CACHE is None
@@ -12275,16 +12182,15 @@ def get_capabilities_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
             force_overrides_reload=(abs(overrides_mtime - CAPABILITIES_OVERRIDES_CACHE_MTIME) > 1e-6)
         )
 
-    try:
-        payload = json.loads(CAPABILITIES_CATALOG_FILE.read_text(encoding="utf-8"))
-        sanitized = _sanitize_capabilities_catalog_payload(payload)
-        CAPABILITIES_CATALOG_CACHE = sanitized
-        CAPABILITIES_CATALOG_CACHE_TS = now
-        CAPABILITIES_CATALOG_CACHE_MTIME = mtime
-        return sanitized
-    except (json.JSONDecodeError, OSError) as error:
-        print(f"[CAPABILITY CATALOG LOAD ERROR] {error}")
+    payload = STORAGE.get(CAPABILITIES_CATALOG_KEY)
+    if payload is None:
+        print("[CAPABILITY CATALOG LOAD ERROR] stored catalog is missing or unreadable; rebuilding")
         return rebuild_capabilities_catalog(force_overrides_reload=True)
+    sanitized = _sanitize_capabilities_catalog_payload(payload)
+    CAPABILITIES_CATALOG_CACHE = sanitized
+    CAPABILITIES_CATALOG_CACHE_TS = now
+    CAPABILITIES_CATALOG_CACHE_MTIME = mtime
+    return sanitized
 
 
 def parse_capability_query(text: str, catalog: dict[str, Any]) -> dict[str, Any] | None:
@@ -21447,17 +21353,16 @@ CRUSH_GAME = crush_game.CrushGame(
 
 def load_crush_game_state() -> None:
     global CRUSH_GAME_STATE
-    removed = crush_game.purge_legacy_files(
-        [LEGACY_AICRUSH_STATE_FILE, _json_backup_path(LEGACY_AICRUSH_STATE_FILE)]
-    )
+    # The legacy data only ever existed as files under data/, whatever backend is active.
+    removed = storage.JsonFileBackend(DATA_DIR).delete_files(LEGACY_AICRUSH_STATE_KEY)
     if removed:
         print(f"[CRUSH GAME] Deleted legacy aicrush history data: {', '.join(removed)}")
-    CRUSH_GAME_STATE = crush_game.CrushGameState(read_json(CRUSH_GAME_STATE_FILE))
+    CRUSH_GAME_STATE = crush_game.CrushGameState(read_state(CRUSH_GAME_STATE_KEY))
     CRUSH_GAME.state = CRUSH_GAME_STATE
 
 
 def save_crush_game_state(force: bool = False) -> None:
-    if (force or CRUSH_GAME_STATE.dirty) and write_json(CRUSH_GAME_STATE_FILE, CRUSH_GAME_STATE.data):
+    if (force or CRUSH_GAME_STATE.dirty) and write_state(CRUSH_GAME_STATE_KEY, CRUSH_GAME_STATE.data):
         CRUSH_GAME_STATE.dirty = False
 
 
@@ -21544,7 +21449,6 @@ async def wipe_command(ctx: commands.Context) -> None:
     )
 
 
-AGENTIC_STATE_FILE = DATA_DIR / "agentic_state.json"
 AGENTIC_STATE = agentic_automation.AgenticState()
 AGENTIC_RECENT_CASES: dict[tuple[int, int], deque[str]] = defaultdict(lambda: deque(maxlen=10))
 # Per-feature daily caps in the budget governor (GROQ_FEATURE_DAILY_CAPS overrides these).
@@ -21558,14 +21462,14 @@ for _agentic_feature, _agentic_env, _agentic_default in (
 
 def load_agentic_state() -> None:
     global AGENTIC_STATE
-    AGENTIC_STATE = agentic_automation.AgenticState(read_json(AGENTIC_STATE_FILE))
+    AGENTIC_STATE = agentic_automation.AgenticState(read_state(AGENTIC_STATE_KEY))
     AGENTIC_SCHEDULER.state = AGENTIC_STATE
     AGENTIC_ESCALATION.state = AGENTIC_STATE
     AGENTIC_NUDGES.state = AGENTIC_STATE
 
 
 def flush_agentic_state() -> None:
-    if AGENTIC_STATE.dirty and write_json(AGENTIC_STATE_FILE, AGENTIC_STATE.data):
+    if AGENTIC_STATE.dirty and write_state(AGENTIC_STATE_KEY, AGENTIC_STATE.data):
         AGENTIC_STATE.dirty = False
 
 
