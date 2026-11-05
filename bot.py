@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 import agent_core
 import agent_tools
+import agentic_automation
 import groq_budget
 
 try:
@@ -16944,6 +16945,7 @@ async def apply_automod_action(
             action=action,
             moderator=bot.user,
         )
+    await agentic_on_automod_violation(message, action, reason)
 
 
 async def _send_automation_message(
@@ -17293,6 +17295,8 @@ async def on_ready() -> None:
         ai_mod_tick_loop.start()
     if not capabilities_catalog_refresh_loop.is_running():
         capabilities_catalog_refresh_loop.start()
+    if not agentic_tick_loop.is_running():
+        agentic_tick_loop.start()
     if DISCORD_ENABLE_PRESENCE_INTENT:
         for guild in bot.guilds:
             try:
@@ -23107,6 +23111,351 @@ async def agent_command(ctx: commands.Context, *, request: str | None = None) ->
         view.message = await ctx.channel.send(card, view=view, allowed_mentions=AGENT_NO_MENTIONS)
 
 
+# ---------------------------------------------------------------------------
+# Agentic automation (phase 3): scheduled agent tasks, escalation proposals,
+# engagement nudges. All OFF by default; enabled per server via the "agentic"
+# block in mod_config.json (see `&agentic`).
+# ---------------------------------------------------------------------------
+
+AGENTIC_STATE_FILE = DATA_DIR / "agentic_state.json"
+AGENTIC_STATE = agentic_automation.AgenticState()
+AGENTIC_RECENT_CASES: dict[tuple[int, int], deque[str]] = defaultdict(lambda: deque(maxlen=10))
+# Per-feature daily caps in the budget governor (GROQ_FEATURE_DAILY_CAPS overrides these).
+for _agentic_feature, _agentic_env, _agentic_default in (
+    (agentic_automation.FEATURE_SCHEDULED, "AGENTIC_SCHEDULED_DAILY_CAP", 50),
+    (agentic_automation.FEATURE_ESCALATION, "AGENTIC_ESCALATION_DAILY_CAP", 50),
+    (agentic_automation.FEATURE_NUDGE, "AGENTIC_NUDGE_DAILY_CAP", 100),
+):
+    GROQ_BUDGET.feature_caps.setdefault(_agentic_feature, env_int(_agentic_env, _agentic_default, 1))
+
+
+def load_agentic_state() -> None:
+    global AGENTIC_STATE
+    AGENTIC_STATE = agentic_automation.AgenticState(read_json(AGENTIC_STATE_FILE))
+    AGENTIC_SCHEDULER.state = AGENTIC_STATE
+    AGENTIC_ESCALATION.state = AGENTIC_STATE
+    AGENTIC_NUDGES.state = AGENTIC_STATE
+
+
+def flush_agentic_state() -> None:
+    if AGENTIC_STATE.dirty and write_json(AGENTIC_STATE_FILE, AGENTIC_STATE.data):
+        AGENTIC_STATE.dirty = False
+
+
+def get_guild_agentic_config(guild_id: int) -> agentic_automation.AgenticConfig:
+    return agentic_automation.config_for_guild(load_mod_config(), guild_id)
+
+
+def _agentic_raw_block(config: dict, guild_id: int) -> dict:
+    guild_cfg = config.setdefault(str(guild_id), {})
+    block = guild_cfg.get(agentic_automation.CONFIG_KEY)
+    if not isinstance(block, dict):
+        block = {}
+        guild_cfg[agentic_automation.CONFIG_KEY] = block
+    return block
+
+
+def _agentic_complete(policy_key: str):
+    async def complete(messages: list[dict[str, str]]) -> str:
+        # Same governor-routed path as &agent, under its own feature cap.
+        return await request_ai_completion(
+            messages,
+            max_tokens=AGENT_MAX_TOKENS,
+            temperature=0.2,
+            policy_key=policy_key,
+            include_fallback_notice=False,
+        )
+
+    return complete
+
+
+async def _agentic_post(channel: Any, text: str) -> None:
+    safe, _ = screen_agent_text(text)
+    for chunk in split_message(safe):
+        await channel.send(chunk, allowed_mentions=AGENT_NO_MENTIONS)
+
+
+async def _agentic_post_card(channel: Any, action: agent_tools.PendingAction) -> None:
+    card, problem = screen_agent_text(agent_tools.render_card(action))
+    if problem:
+        AGENT_PENDING.expire(action.id)
+        await channel.send(f"Agent action #{action.id} was withheld by the safety filter.")
+        return
+    view = agent_tools.build_pending_action_view(AGENT_PENDING, action)
+    view.message = await channel.send(card, view=view, allowed_mentions=AGENT_NO_MENTIONS)
+
+
+async def _agentic_case_history(guild: discord.Guild, member: Any) -> list[str]:
+    # Read-only: stored warnings plus the recent AutoMod cases seen this session.
+    lines: list[str] = []
+    for entry in load_warnings().get(str(guild.id), {}).get(str(member.id), [])[-5:]:
+        if isinstance(entry, dict):
+            lines.append(f"Warning: {str(entry.get('reason', ''))[:150]} ({entry.get('timestamp', '?')})")
+    lines.extend(AGENTIC_RECENT_CASES.get((guild.id, member.id), []))
+    return lines
+
+
+def _agentic_mod_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    channel_id = get_guild_mod_log_channel_id(guild.id)
+    channel = guild.get_channel(channel_id) if channel_id else None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+def _agentic_on_escalation_accept(ctx: agent_tools.AgentContext, args: dict[str, Any]) -> None:
+    if str(args.get("recommendation")) == "watch":
+        member = args.get("member")
+        watch = AGENTIC_STATE.guild(ctx.guild.id)["watchlist"]
+        watch[str(getattr(member, "id", 0))] = time.time()
+        AGENTIC_STATE.mark()
+
+
+async def _agentic_send_nudge(channel: Any, member_id: int, text: str) -> bool:
+    try:
+        await channel.send(
+            f"<@{member_id}> {text}",
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(id=member_id)]),
+        )
+        return True
+    except discord.HTTPException:
+        return False
+
+
+AGENTIC_SCHEDULER = agentic_automation.ScheduledTaskScheduler(
+    state=AGENTIC_STATE,
+    registry=AGENT_REGISTRY,
+    pending=AGENT_PENDING,
+    complete=_agentic_complete(agentic_automation.FEATURE_SCHEDULED),
+    post=_agentic_post,
+    post_card=_agentic_post_card,
+    limits=AGENT_LIMITS,
+)
+AGENTIC_ESCALATION = agentic_automation.EscalationMonitor(
+    state=AGENTIC_STATE,
+    pending=AGENT_PENDING,
+    post_card=_agentic_post_card,
+    case_history=_agentic_case_history,
+    complete=_agentic_complete(agentic_automation.FEATURE_ESCALATION),
+    resolve_mod_channel=_agentic_mod_channel,
+    on_accept=_agentic_on_escalation_accept,
+)
+AGENTIC_NUDGES = agentic_automation.NudgeEngine(
+    state=AGENTIC_STATE,
+    admit_feature=GROQ_BUDGET.try_admit_feature,
+    send=_agentic_send_nudge,
+)
+
+
+async def agentic_on_automod_violation(message: discord.Message, action: str, reason: str) -> None:
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return
+    config = get_guild_agentic_config(message.guild.id)
+    if not config.escalation.enabled:
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    AGENTIC_RECENT_CASES[(message.guild.id, message.author.id)].append(
+        f"AutoMod: {action} - {reason[:120]} ({stamp} UTC)"
+    )
+    try:
+        await AGENTIC_ESCALATION.on_violation(message.guild, message.author, config)
+    except Exception as error:
+        print(f"[AGENTIC ESCALATION ERROR] guild={message.guild.id} error={error}")
+
+
+def _agentic_nudge_candidates(guild: discord.Guild, config: agentic_automation.AgenticConfig):
+    opted_in = AGENTIC_NUDGES.opted_in(guild.id)
+    if not opted_in:
+        return []
+    users = get_guild_engagement_state(guild.id).get("users", {})
+    if not isinstance(users, dict):
+        return []
+    tz = _safe_zoneinfo(get_guild_engagement_timezone(guild.id))
+    quests_on = config.nudges.quests and get_guild_quest_mode_enabled(guild.id)
+
+    def day_of(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).strftime("%Y-%m-%d")
+
+    def open_quests(member_id: int) -> int:
+        row = users.get(str(member_id))
+        if not isinstance(row, dict):
+            return 0
+        quests, _, completed = get_user_daily_quests(guild.id, row)
+        return sum(1 for q in quests if str(q.get("id", "")) not in completed)
+
+    return agentic_automation.build_nudge_candidates(
+        {k: v for k, v in users.items() if str(k).isdigit() and int(k) in set(opted_in)},
+        opted_in=opted_in,
+        today=_guild_day_key(guild.id),
+        day_of=day_of,
+        open_quests=open_quests if quests_on else None,
+    )
+
+
+async def run_agentic_tick() -> None:
+    for guild in bot.guilds:
+        config = get_guild_agentic_config(guild.id)
+        try:
+            if config.scheduled_enabled and is_ai_configured():
+                await AGENTIC_SCHEDULER.tick(guild, config)
+            if config.nudges.enabled:
+                channel = guild.get_channel(config.nudges.channel_id) if config.nudges.channel_id else None
+                if channel is None:
+                    channel = resolve_engagement_channel(guild)
+                await AGENTIC_NUDGES.tick(guild, config, _agentic_nudge_candidates(guild, config), channel)
+        except Exception as error:
+            print(f"[AGENTIC TICK ERROR] guild={guild.id} error={error}")
+    flush_agentic_state()
+
+
+@tasks.loop(minutes=1.0)
+async def agentic_tick_loop() -> None:
+    await run_agentic_tick()
+
+
+@agentic_tick_loop.before_loop
+async def _before_agentic_tick_loop() -> None:
+    await bot.wait_until_ready()
+
+
+def _agentic_status_lines(guild: discord.Guild) -> list[str]:
+    config = get_guild_agentic_config(guild.id)
+    esc, ndg = config.escalation, config.nudges
+    lines = [
+        f"Scheduled tasks: `{'on' if config.scheduled_enabled else 'off'}`",
+    ]
+    for task in config.tasks:
+        used = AGENTIC_SCHEDULER.calls_today(guild.id, task.name)
+        lines.append(
+            f"- `{task.name}` [{'enabled' if task.enabled else 'disabled'}] `{task.schedule}` UTC -> "
+            f"<#{task.channel_id}> (calls today {used}/{task.daily_cap})"
+        )
+    lines.append(
+        f"Escalation proposals: `{'on' if esc.enabled else 'off'}` (threshold {esc.threshold} in "
+        f"{esc.window_hours:g}h, channel {f'<#{esc.mod_channel_id}>' if esc.mod_channel_id else 'mod-log'})"
+    )
+    lines.append(
+        f"Engagement nudges: `{'on' if ndg.enabled else 'off'}` (sent today "
+        f"{AGENTIC_NUDGES.sent_today(guild.id)}/{ndg.server_daily_cap}, opted in "
+        f"{len(AGENTIC_NUDGES.opted_in(guild.id))})"
+    )
+    return lines
+
+
+AGENTIC_USAGE = (
+    f"`{PREFIX}agentic status`\n"
+    f"`{PREFIX}agentic scheduled on|off`\n"
+    f"`{PREFIX}agentic task add <name> | <cron or @daily/@weekly> | #channel | <prompt>`\n"
+    f"`{PREFIX}agentic task enable|disable|remove <name>`\n"
+    f"`{PREFIX}agentic task cap <name> <calls per day>`\n"
+    f"`{PREFIX}agentic escalation on|off [threshold] [#mod-channel]`\n"
+    f"`{PREFIX}agentic nudges on|off [#channel] [server daily cap]`\n"
+    "New tasks start disabled. Schedules are evaluated in UTC."
+)
+
+
+@bot.command(name="agentic")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def agentic_command(ctx: commands.Context, *, args: str | None = None) -> None:
+    text = (args or "").strip()
+    words = text.split()
+    sub = words[0].lower() if words else "status"
+    if sub == "status":
+        await ctx.send("\n".join(_agentic_status_lines(ctx.guild)), allowed_mentions=AGENT_NO_MENTIONS)
+        return
+
+    config = load_mod_config()
+    block = _agentic_raw_block(config, ctx.guild.id)
+    channel_ids = [c.id for c in ctx.message.channel_mentions]
+
+    def toggle(word: str) -> bool | None:
+        return {"on": True, "off": False}.get(word.lower())
+
+    if sub in {"scheduled", "escalation", "nudges"} and len(words) >= 2 and toggle(words[1]) is not None:
+        key = "scheduled_tasks" if sub == "scheduled" else sub
+        section = block.setdefault(key, {})
+        section["enabled"] = toggle(words[1])
+        numbers = [int(w) for w in words[2:] if w.isdigit()]
+        if sub == "escalation":
+            if numbers:
+                section["threshold"] = max(1, min(100, numbers[0]))
+            if channel_ids:
+                section["mod_channel_id"] = channel_ids[0]
+        if sub == "nudges":
+            if numbers:
+                section["server_daily_cap"] = max(0, min(agentic_automation.MAX_NUDGE_SERVER_DAILY_CAP, numbers[0]))
+            if channel_ids:
+                section["channel_id"] = channel_ids[0]
+        save_mod_config(config)
+        await ctx.send(f"Agentic `{sub}` is now `{words[1].lower()}`.")
+        return
+
+    if sub == "task" and len(words) >= 2:
+        action = words[1].lower()
+        section = block.setdefault("scheduled_tasks", {})
+        tasks_raw = section.setdefault("tasks", [])
+        if action == "add":
+            parts = [p.strip() for p in text.split(None, 2)[2].split("|")] if len(words) > 2 else []
+            if len(parts) != 4 or not channel_ids:
+                await ctx.send(f"Usage: `{PREFIX}agentic task add <name> | <schedule> | #channel | <prompt>`")
+                return
+            name, schedule, _, prompt = parts
+            try:
+                agentic_automation.CronSchedule(schedule)
+            except ValueError as error:
+                await ctx.send(f"Invalid schedule: {error}")
+                return
+            if any(str(t.get("name", "")).lower() == name.lower() for t in tasks_raw if isinstance(t, dict)):
+                await ctx.send(f"A task named `{name}` already exists.")
+                return
+            if len(tasks_raw) >= agentic_automation.MAX_TASKS_PER_GUILD:
+                await ctx.send(f"At most {agentic_automation.MAX_TASKS_PER_GUILD} tasks per server.")
+                return
+            task = {"name": name[:50], "schedule": schedule, "channel_id": channel_ids[0],
+                    "prompt": prompt[: agentic_automation.MAX_PROMPT_CHARS], "enabled": False,
+                    "daily_cap": agentic_automation.DEFAULT_TASK_DAILY_CAP}
+            if agentic_automation.parse_task(task) is None:
+                await ctx.send("That task is incomplete; name, schedule, channel and prompt are required.")
+                return
+            tasks_raw.append(task)
+            save_mod_config(config)
+            await ctx.send(f"Task `{name}` added (disabled). Enable it with `{PREFIX}agentic task enable {name}`.")
+            return
+        if action in {"enable", "disable", "remove", "cap"} and len(words) >= 3:
+            name = words[2]
+            match = next((t for t in tasks_raw if isinstance(t, dict) and str(t.get("name", "")).lower() == name.lower()), None)
+            if match is None:
+                await ctx.send(f"No task named `{name}`.")
+                return
+            if action == "remove":
+                tasks_raw.remove(match)
+            elif action == "cap":
+                if len(words) < 4 or not words[3].isdigit():
+                    await ctx.send(f"Usage: `{PREFIX}agentic task cap <name> <calls per day>`")
+                    return
+                match["daily_cap"] = max(0, min(agentic_automation.MAX_TASK_DAILY_CAP, int(words[3])))
+            else:
+                match["enabled"] = action == "enable"
+            save_mod_config(config)
+            await ctx.send(f"Task `{name}`: {action} done.")
+            return
+
+    await ctx.send(AGENTIC_USAGE)
+
+
+@bot.command(name="nudges")
+@commands.guild_only()
+async def nudges_command(ctx: commands.Context, setting: str | None = None) -> None:
+    choice = (setting or "").strip().lower()
+    if choice not in {"on", "off"}:
+        state = "on" if AGENTIC_NUDGES.is_opted_in(ctx.guild.id, ctx.author.id) else "off"
+        await ctx.send(f"Your streak/quest reminders are `{state}`. Use `{PREFIX}nudges on|off`.")
+        return
+    AGENTIC_NUDGES.set_opt_in(ctx.guild.id, ctx.author.id, choice == "on")
+    flush_agentic_state()
+    note = "" if get_guild_agentic_config(ctx.guild.id).nudges.enabled else " (reminders are currently off on this server)"
+    await ctx.send(f"Streak/quest reminders `{choice}`{note}.")
+
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception) -> None:
     original_error = getattr(error, "original", error)
@@ -23154,6 +23503,7 @@ def main() -> None:
     load_altfinder_state()
     load_socialintel_state()
     load_business_state()
+    load_agentic_state()
     bot.run(TOKEN)
 
 

@@ -225,6 +225,9 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `GROQ_ALLOW_ENTERPRISE_MODELS=0`
 - `AGENT_DAILY_CAP=20`
 - `AGENT_MAX_TOKENS=500`
+- `AGENTIC_SCHEDULED_DAILY_CAP=50`
+- `AGENTIC_ESCALATION_DAILY_CAP=50`
+- `AGENTIC_NUDGE_DAILY_CAP=100`
 - `FFMPEG_PATH=ffmpeg`
 - `MUSIC_MAX_PLAYLIST_ITEMS=50`
 - `SPOTIFY_CLIENT_ID=`
@@ -267,6 +270,33 @@ output with the bot's blocked-word list and AI-guard heuristics before posting.
   UTC day (default 20).
 
 Run the tests with `pip install -r requirements-dev.txt && python -m pytest`.
+
+## Agentic Automation
+
+`agentic_automation.py` lets the bot run agent work on its own, inside hard limits. **Everything is off by
+default** and enabled per server (Manage Server permission) with `&agentic`; settings live in the server's
+`"agentic"` block in `data/mod_config.json`, runtime counters in `data/agentic_state.json`. With no block,
+nothing runs. A one-minute `discord.ext.tasks` loop (like the other bot loops) drives the scheduler and nudges.
+
+- **Scheduled agent tasks** (`&agentic scheduled on`, `&agentic task add <name> | <schedule> | #channel | <prompt>`,
+  `&agentic task enable <name>`, `&agentic task cap <name> <n>`): each task has a name, a 5-field cron schedule
+  evaluated in UTC (or `@daily` / `@weekly` / `@hourly` / `@monthly`), a target channel, a prompt and an
+  enabled flag (new tasks start disabled). Runs go through the same `agent_core` loop, tool registry and
+  pending-action manager as `&agent`, so consequential tools only produce Confirm cards; a scheduled run never
+  executes them. Each task has its own daily model-call cap (default 10), and all scheduled runs share the
+  governor feature `agent_scheduled`.
+- **Escalation proposals** (`&agentic escalation on [threshold] [#mod-channel]`): when AutoMod records
+  `threshold` violations (default 3) by a member within 24h, the agent reads the member's warnings and recent
+  AutoMod cases (read-only), and posts ONE proposal card (timeout / ban / watch) to the mod channel (default:
+  the mod-log channel). At most one proposal per member per 24h. Confirm only acknowledges it in the mod-log;
+  nothing is applied automatically. Governor feature: `agent_escalation`.
+- **Engagement nudges** (`&agentic nudges on [#channel] [server daily cap]`): templated streak reminders
+  (streak still alive, not active yet today) and open-quest reminders, only for members who opted in with
+  `&nudges on`. At most one nudge per member per day, `server daily cap` per server per day (default 10), and
+  each nudge must be admitted by the governor's `engagement_nudge` daily cap (no model call).
+
+The governor caps for these features default to the `AGENTIC_*_DAILY_CAP` values above; `GROQ_FEATURE_DAILY_CAPS`
+overrides them. `&agentic status` shows what is on and today's usage.
 
 ## Required Bot Permissions
 
