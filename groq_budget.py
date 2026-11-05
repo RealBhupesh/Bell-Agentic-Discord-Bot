@@ -20,12 +20,15 @@ coroutine that performs the actual request for one model.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 # ---------------------------------------------------------------------------
@@ -36,15 +39,57 @@ DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_GROQ_FALLBACK_MODELS = "openai/gpt-oss-20b,qwen/qwen3.8-27b"
 
 
+# Models that Groq only serves on paid (Enterprise/Developer) tiers. They are
+# never used unless GROQ_ALLOW_ENTERPRISE_MODELS=1 is set explicitly.
+ENTERPRISE_MODEL_IDS = frozenset({"llama-3.3-70b-versatile", "llama-3.1-8b-instant"})
+ENTERPRISE_MODEL_PREFIXES = ("moonshotai/kimi-k2-",)
+ALLOW_ENTERPRISE_ENV = "GROQ_ALLOW_ENTERPRISE_MODELS"
+
+
 def _split_models(raw: str) -> list[str]:
     return [model.strip() for model in raw.split(",") if model.strip()]
+
+
+def is_enterprise_model(model: str) -> bool:
+    name = (model or "").strip().lower()
+    return name in ENTERPRISE_MODEL_IDS or name.startswith(ENTERPRISE_MODEL_PREFIXES)
+
+
+def enterprise_models_allowed(environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    return str(env.get(ALLOW_ENTERPRISE_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def filter_model_chain(models: list[str], environ: Mapping[str, str] | None = None) -> list[str]:
+    """Drop Enterprise-tier models from ``models`` unless the opt-in env is set."""
+    if enterprise_models_allowed(environ):
+        return list(models)
+    return [model for model in models if not is_enterprise_model(model)]
+
+
+def load_model_chain(
+    key: str, default: str, environ: Mapping[str, str] | None = None
+) -> list[str]:
+    """Comma-separated model chain from ``key`` (or ``default``), Enterprise models gated."""
+    env = os.environ if environ is None else environ
+    raw = env.get(key)
+    return filter_model_chain(_split_models(default if raw is None else str(raw)), env)
+
+
+def load_primary_model(key: str, default: str, environ: Mapping[str, str] | None = None) -> str:
+    """Single model from ``key``; an Enterprise model falls back to ``default`` unless opted in."""
+    env = os.environ if environ is None else environ
+    model = str(env.get(key, default)).strip() or default
+    if is_enterprise_model(model) and not enterprise_models_allowed(env):
+        return default
+    return model
 
 
 def load_groq_model_config(environ: Mapping[str, str] | None = None) -> tuple[str, list[str]]:
     """Return ``(GROQ_MODEL, GROQ_FALLBACK_MODELS)`` honouring env overrides."""
     env = os.environ if environ is None else environ
-    model = env.get("GROQ_MODEL", DEFAULT_GROQ_MODEL).strip()
-    fallbacks = _split_models(env.get("GROQ_FALLBACK_MODELS", DEFAULT_GROQ_FALLBACK_MODELS))
+    model = load_primary_model("GROQ_MODEL", DEFAULT_GROQ_MODEL, env)
+    fallbacks = load_model_chain("GROQ_FALLBACK_MODELS", DEFAULT_GROQ_FALLBACK_MODELS, env)
     return model, fallbacks
 
 
@@ -307,6 +352,9 @@ class GroqBudgetGovernor:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         day_key: Callable[[], str] = _utc_day_key,
+        allow_enterprise_models: bool = False,
+        state_path: str | os.PathLike[str] | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.default_limits = default_limits
         self.model_limits = builtin_model_limits(default_limits)
@@ -325,6 +373,11 @@ class GroqBudgetGovernor:
         self._waiters: deque[asyncio.Future[None]] = deque()
         self._circuit_open_until = 0.0
         self._circuit_daily = False
+        self.allow_enterprise_models = bool(allow_enterprise_models)
+        self._wall_clock = wall_clock
+        self.state_path = Path(state_path) if state_path else None
+        if self.state_path is not None:
+            self._load_state()
 
     # -- construction -----------------------------------------------------
 
@@ -346,6 +399,8 @@ class GroqBudgetGovernor:
             max_wait_seconds=_env_float(env, "GROQ_BUDGET_MAX_WAIT_SECONDS", 20.0, 0.0),
             default_retry_after=_env_float(env, "GROQ_DEFAULT_RETRY_AFTER_SECONDS", 60.0, 1.0),
             max_queue=_env_int(env, "GROQ_QUEUE_MAX", 100, 1),
+            allow_enterprise_models=enterprise_models_allowed(env),
+            state_path=str(env.get("GROQ_BUDGET_STATE_FILE", "")).strip() or None,
         )
         kwargs.update(overrides)
         return cls(**kwargs)
@@ -406,11 +461,13 @@ class GroqBudgetGovernor:
         if cap > 0 and usage.used >= cap:
             raise FeatureCapExceededError(feature)
         usage.used += 1
+        self._save_state()
 
     def _refund_feature(self, feature: str) -> None:
         usage = self._features.get(feature)
         if usage is not None and usage.day == self._day_key() and usage.used > 0:
             usage.used -= 1
+            self._save_state()
 
     # -- FIFO queue -------------------------------------------------------
 
@@ -458,6 +515,7 @@ class GroqBudgetGovernor:
             if wait > 0:
                 await self._sleep(wait)
             state.reserve(tokens, self._clock())
+            self._save_state()
             return True
         finally:
             self._release_turn()
@@ -474,6 +532,7 @@ class GroqBudgetGovernor:
             state.tpd.drain(now)
         # Groq's own window is authoritative: our minute view was too optimistic.
         state.rpm.drain(now)
+        self._save_state()
 
     def _daily_exhausted(self, state: _ModelState, tokens: int, now: float) -> bool:
         return (
@@ -493,7 +552,126 @@ class GroqBudgetGovernor:
         waits = [state.wait_time(tokens, now) for state in states]
         self._circuit_open_until = now + (min(waits) if waits else self.default_retry_after)
         self._circuit_daily = all(self._daily_exhausted(state, tokens, now) for state in states)
+        self._save_state()
         return self._circuit_error()
+
+    # -- durable counters -------------------------------------------------
+    #
+    # Bucket timestamps are monotonic-clock values, which do not survive a
+    # restart, so they are stored as wall-clock times and converted back on
+    # load. A single bot process is assumed to own the file.
+
+    STATE_VERSION = 1
+
+    def _to_wall(self, mono: float, mono_now: float, wall_now: float) -> float:
+        return wall_now - (mono_now - mono)
+
+    def _from_wall(self, wall: float, mono_now: float, wall_now: float) -> float:
+        # Clamp so a wall clock that moved backwards never refills buckets early.
+        return mono_now - max(0.0, wall_now - wall)
+
+    def export_state(self) -> dict[str, Any]:
+        mono_now = self._clock()
+        wall_now = self._wall_clock()
+
+        def bucket(b: TokenBucket) -> dict[str, float]:
+            return {"tokens": b.tokens, "updated": self._to_wall(b.updated, mono_now, wall_now)}
+
+        models: dict[str, Any] = {}
+        for model, state in self._models.items():
+            models[model] = {
+                "rpm": bucket(state.rpm),
+                "rpd": bucket(state.rpd),
+                "tpm": bucket(state.tpm),
+                "tpd": bucket(state.tpd),
+                "blocked_until": self._to_wall(state.blocked_until, mono_now, wall_now)
+                if state.blocked_until > mono_now
+                else 0.0,
+            }
+        return {
+            "version": self.STATE_VERSION,
+            "saved_at": wall_now,
+            "models": models,
+            "features": {name: {"day": u.day, "used": u.used} for name, u in self._features.items()},
+            "circuit": {
+                "open_until": self._to_wall(self._circuit_open_until, mono_now, wall_now)
+                if self._circuit_open_until > mono_now
+                else 0.0,
+                "daily": self._circuit_daily,
+            },
+        }
+
+    def import_state(self, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping) or payload.get("version") != self.STATE_VERSION:
+            return
+        mono_now = self._clock()
+        wall_now = self._wall_clock()
+
+        def restore(b: TokenBucket, raw: Any) -> None:
+            if not isinstance(raw, Mapping):
+                return
+            try:
+                tokens = float(raw.get("tokens", b.capacity))
+                updated = float(raw.get("updated", wall_now))
+            except (TypeError, ValueError):
+                return
+            b.tokens = min(b.capacity, tokens)
+            b.updated = self._from_wall(updated, mono_now, wall_now)
+
+        models = payload.get("models")
+        if isinstance(models, Mapping):
+            for model, raw in models.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                state = self._state(str(model))
+                for name in ("rpm", "rpd", "tpm", "tpd"):
+                    restore(getattr(state, name), raw.get(name))
+                try:
+                    blocked = float(raw.get("blocked_until", 0.0))
+                except (TypeError, ValueError):
+                    blocked = 0.0
+                if blocked > wall_now:
+                    state.blocked_until = mono_now + (blocked - wall_now)
+
+        features = payload.get("features")
+        if isinstance(features, Mapping):
+            for name, raw in features.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                try:
+                    used = max(0, int(raw.get("used", 0)))
+                except (TypeError, ValueError):
+                    continue
+                self._features[str(name)] = _FeatureUsage(day=str(raw.get("day", "")), used=used)
+
+        circuit = payload.get("circuit")
+        if isinstance(circuit, Mapping):
+            try:
+                open_until = float(circuit.get("open_until", 0.0))
+            except (TypeError, ValueError):
+                open_until = 0.0
+            if open_until > wall_now:
+                self._circuit_open_until = mono_now + (open_until - wall_now)
+                self._circuit_daily = bool(circuit.get("daily", False))
+
+    def _load_state(self) -> None:
+        path = self.state_path
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            print(f"[GROQ BUDGET] Ignoring unreadable state file `{path}`: {error}")
+            return
+        self.import_state(payload)
+
+    def _save_state(self) -> None:
+        if self.state_path is None:
+            return
+        try:
+            atomic_write_json(self.state_path, self.export_state())
+        except OSError as error:
+            print(f"[GROQ BUDGET] Could not save state file `{self.state_path}`: {error}")
 
     # -- main entry point -------------------------------------------------
 
@@ -517,8 +695,13 @@ class GroqBudgetGovernor:
             cleaned = (model or "").strip()
             if cleaned and cleaned not in ordered:
                 ordered.append(cleaned)
+        if not self.allow_enterprise_models:
+            ordered = [model for model in ordered if not is_enterprise_model(model)]
         if not ordered:
-            raise RuntimeError("No Groq models configured.")
+            raise RuntimeError(
+                "No Groq models configured (Enterprise-tier models need "
+                f"{ALLOW_ENTERPRISE_ENV}=1)."
+            )
 
         if self.circuit_open():
             raise self._circuit_error()
@@ -558,11 +741,31 @@ class GroqBudgetGovernor:
                 delta = int(used) - tokens
                 state.tpm.adjust(delta, now)
                 state.tpd.adjust(delta, now)
+                self._save_state()
             return model, value
 
         if budget_blocked == len(ordered):
             raise self._open_circuit(ordered, tokens)
         raise RuntimeError(str(last_error) if last_error else "Groq request failed.")
+
+
+def atomic_write_json(path: str | os.PathLike[str], payload: Any) -> None:
+    """Write JSON so readers only ever see the old or the new complete file."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def parse_retry_after(value: str | None) -> float | None:
