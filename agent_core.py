@@ -1,7 +1,8 @@
 """Plan-act-check loop behind the ``&agent`` command.
 
 The loop asks the model (through a ``complete`` callable that bot.py wires to
-its existing governor-routed ``request_ai_completion``) for one JSON decision
+its existing ``request_ai_completion``, which goes through the budget governor
+when the provider is Groq) for one JSON decision
 at a time: either call a tool from :mod:`agent_tools` or give the final reply.
 
 Limits per request: at most ``max_tool_calls`` tool calls (default 5), one

@@ -4786,8 +4786,8 @@ async def handle_welcome_concierge_dm(message: discord.Message) -> bool:
 
 
 # Small text helpers originally written for the old aicrush index. The
-# history-mining crush feature is gone (see crush_game.py); roast, vibe and
-# translation still use these helpers.
+# history-mining crush feature is gone (see crush_game.py); the alt-finder,
+# social stats and translation code still use these helpers.
 
 
 AICRUSH_ALIAS_STOP_WORDS = {
