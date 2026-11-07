@@ -24,6 +24,7 @@ Further docs:
   synthetic data.
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): self-hosting, storage options (JSON or Postgres),
   owner-only decisions, logs.
+- [docs/TESTING.md](docs/TESTING.md): the offline suite, the PostgreSQL integration tests and CI.
 - [.env.example](.env.example): every supported environment variable, with a comment and a safe
   default.
 
@@ -254,7 +255,9 @@ python -m pytest -q
 
 The suite needs no Discord token, network access or database. The Postgres backend is exercised
 against an in-process fake (`tests/fakes.py`), and state fixtures under `tests/fixtures/` are
-synthetic.
+synthetic. Integration tests against a real PostgreSQL server
+(`tests/test_storage_postgres_integration.py`) are skipped unless `BELL_TEST_DATABASE_URL` is set;
+see [docs/TESTING.md](docs/TESTING.md) for running them locally with Docker and for CI.
 
 You can also preview a Postgres migration against the synthetic fixtures without a database:
 
@@ -337,8 +340,12 @@ own per-task cap (default 10), and nudges have a per-server daily cap (default 1
 
 - The unit tests (`python -m pytest`) cover the governor, storage adapter, migration dry run, agent
   loop and tools, agentic automation and the crush game, all with fakes and synthetic fixtures.
-- **The Postgres backend has only been exercised against fakes and local tests. It has never been
-  run against a live hosted Postgres database.** Treat it as experimental.
+- The Postgres backend is tested against fakes and, in CI, against a throwaway PostgreSQL 16
+  container (`tests/test_storage_postgres_integration.py`: adapter contract, concurrent locked
+  updates from two connection pools, the Groq governor and the migration script). **It has never
+  been run against a live hosted Postgres database or with the bot connected to Discord.** Treat it
+  as experimental. Known JSON/Postgres differences are listed in
+  [docs/TESTING.md](docs/TESTING.md#known-differences-between-the-json-and-postgresql-backends).
 - The Groq free-tier limits used as defaults come from Groq's public docs and have not been tested
   against the owner's key.
 - Nothing in this repository should be described as production-proven.
