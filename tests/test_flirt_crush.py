@@ -43,11 +43,11 @@ class RankTests(unittest.TestCase):
         self.assertTrue(ranked[0].mutual)
         self.assertEqual(ranked[0].flirts_sent, 12)
 
-    def test_only_opposite_gender(self):
-        edges = {"1": {"4": edge(10, 20.0, 30), "5": edge(10, 20.0, 30), "2": edge(1, 1.0, 1)}}
+    def test_same_gender_left_out_unknown_kept(self):
+        edges = {"1": {"4": edge(10, 20.0, 30), "5": edge(10, 5.0, 6), "2": edge(1, 1.0, 1)}}
         ranked, stats = self.rank(edges)
-        self.assertEqual([c.user_id for c in ranked], [2])
-        self.assertEqual(stats["wrong_gender"], 1)
+        self.assertEqual([c.user_id for c in ranked], [5, 2])
+        self.assertEqual(stats["same_gender"], 1)
         self.assertEqual(stats["unknown_gender"], 1)
 
     def test_unknown_target_gender_includes_everyone(self):
@@ -70,6 +70,26 @@ class RankTests(unittest.TestCase):
         ranked, _ = self.rank(edges)
         self.assertGreater(fc.crush_confidence(ranked), 60)
         self.assertEqual(fc.crush_confidence([]), 0)
+
+
+class GenderGuessTests(unittest.TestCase):
+    def test_self_votes(self):
+        self.assertEqual(fc.self_gender_votes("main ghar ja raha hu, kal milunga"), (2.0, 0.0))
+        self.assertEqual(fc.self_gender_votes("main thak gayi hoon, so rahi hu"), (0.0, 2.0))
+        self.assertEqual(fc.self_gender_votes("I'm a girl lol"), (0.0, 1.0))
+        self.assertEqual(fc.self_gender_votes("wo ja raha hai, usne kaha tha"), (0.0, 0.0))
+
+    def test_address_votes(self):
+        self.assertEqual(fc.address_gender_votes("bro what"), (0.5, 0.0))
+        self.assertEqual(fc.address_gender_votes("didi please"), (0.0, 0.5))
+        self.assertEqual(fc.address_gender_votes("broccoli is great"), (0.0, 0.0))
+
+    def test_resolve(self):
+        self.assertEqual(fc.resolve_gender({"male": 4, "female": 0.5}), "male")
+        self.assertEqual(fc.resolve_gender({"male": 0, "female": 3}), "female")
+        self.assertIsNone(fc.resolve_gender({"male": 1, "female": 0}))
+        self.assertIsNone(fc.resolve_gender({"male": 3, "female": 3}))
+        self.assertIsNone(fc.resolve_gender(None))
 
 
 if __name__ == "__main__":

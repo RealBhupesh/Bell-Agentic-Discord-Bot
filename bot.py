@@ -5437,6 +5437,28 @@ def _aicrush_update_edge(
     _aicrush_append_unique_sample(samples, sample_text, 6)
 
 
+def _aicrush_add_gender_votes(
+    guild_state: dict[str, Any], user_id: int, male: float, female: float
+) -> None:
+    if male <= 0 and female <= 0:
+        return
+    votes_by_user = guild_state.setdefault("meta", {}).setdefault("gender_votes", {})
+    row = votes_by_user.setdefault(str(user_id), {"male": 0.0, "female": 0.0})
+    row["male"] = round(float(row.get("male", 0.0) or 0.0) + male, 3)
+    row["female"] = round(float(row.get("female", 0.0) or 0.0) + female, 3)
+
+
+def guess_member_gender(guild_state: dict[str, Any], member: discord.Member) -> str | None:
+    """Gender from existing role names if any, otherwise from how they chat. No setup needed."""
+    from_roles = detect_member_gender_from_roles(member)
+    if from_roles is not None:
+        return from_roles
+    votes = guild_state.get("meta", {}).get("gender_votes", {})
+    if not isinstance(votes, dict):
+        return None
+    return flirt_crush.resolve_gender(votes.get(str(member.id)))
+
+
 def _aicrush_add_flirt(
     guild_state: dict[str, Any],
     source_id: int,
@@ -5561,6 +5583,7 @@ def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -
     meta["messages_indexed"] = int(meta.get("messages_indexed", 0) or 0) + 1
 
     _aicrush_update_user_profile(guild_state, member, content, created_ts)
+    _aicrush_add_gender_votes(guild_state, member.id, *flirt_crush.self_gender_votes(content))
     direct_target_ids = {
         int(mentioned.id)
         for mentioned in message.mentions
@@ -5568,6 +5591,13 @@ def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -
     }
     reply_target_id = _aicrush_resolve_reply_target_id(message)
     impacted_ids: set[int] = {member.id}
+    addressed_ids = set(direct_target_ids)
+    if reply_target_id is not None and reply_target_id != member.id:
+        addressed_ids.add(reply_target_id)
+    if addressed_ids:
+        male_vote, female_vote = flirt_crush.address_gender_votes(content)
+        for addressed_id in addressed_ids:
+            _aicrush_add_gender_votes(guild_state, addressed_id, male_vote, female_vote)
 
     _aicrush_remember_message_author(int(message.id), int(member.id), created_ts)
 
@@ -21666,7 +21696,7 @@ def _flirt_crush_coverage(guild: discord.Guild) -> tuple[int, int]:
 
 def build_flirt_crush_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
     guild_state = get_guild_aicrush_state(guild.id)
-    target_gender = detect_member_gender_from_roles(member)
+    target_gender = guess_member_gender(guild_state, member)
 
     def eligible(uid: int) -> bool:
         other = guild.get_member(uid)
@@ -21674,7 +21704,7 @@ def build_flirt_crush_embed(guild: discord.Guild, member: discord.Member) -> dis
 
     def gender_of(uid: int) -> str | None:
         other = guild.get_member(uid)
-        return detect_member_gender_from_roles(other) if other is not None else None
+        return guess_member_gender(guild_state, other) if other is not None else None
 
     candidates, stats = flirt_crush.rank_crush_candidates(
         member.id,
@@ -21693,11 +21723,6 @@ def build_flirt_crush_embed(guild: discord.Guild, member: discord.Member) -> dis
         lines = [f"I haven't seen {member.mention} flirt with anyone yet."]
         if top is not None:
             lines.append(f"But <@{top.user_id}> has been flirting with **them** 👀")
-        if stats["wrong_gender"] or stats["unknown_gender"]:
-            lines.append(
-                f"(Skipped {stats['wrong_gender'] + stats['unknown_gender']} people who aren't the opposite gender "
-                "or have no gender role.)"
-            )
         embed.description = "\n".join(lines)
     else:
         confidence = flirt_crush.crush_confidence(candidates)
@@ -21721,18 +21746,12 @@ def build_flirt_crush_embed(guild: discord.Guild, member: discord.Member) -> dis
                 ),
                 inline=False,
             )
-    notes: list[str] = []
-    if target_gender is None:
-        notes.append(
-            f"I couldn't tell {member.display_name}'s gender from their roles, so everyone is included. "
-            f"A mod can fix this with `{PREFIX}setgenderroles @male_role @female_role`."
-        )
-    elif stats["unknown_gender"]:
-        notes.append(f"{stats['unknown_gender']} people were skipped because they have no gender role.")
     if done < total:
-        notes.append(f"Still reading older history ({done}/{total} channels done). Run it again to include more.")
-    notes.append("Only server channels are read, not DMs.")
-    embed.add_field(name="Notes", value="\n".join(notes)[:1024], inline=False)
+        embed.add_field(
+            name="Still reading",
+            value=f"Older chats are still being read ({done}/{total} channels). Run it again in a bit for a sharper answer.",
+            inline=False,
+        )
     embed.set_footer(text=f"Based on {indexed:,} saved messages · For fun only")
     return embed
 

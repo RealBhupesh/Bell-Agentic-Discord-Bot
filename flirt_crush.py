@@ -72,6 +72,69 @@ def flirt_score(text: str) -> float:
     return round(min(MAX_SCORE_PER_MESSAGE, score), 3)
 
 
+# ---- Gender guessing from chat (no roles or setup needed) ----------------------------
+# First-person Hinglish verb forms are gendered: "main ja raha hoon" (m) / "ja rahi hoon" (f).
+# Only forms that can't refer to someone else are used.
+_SELF_MALE = [
+    r"raha (?:hoon|hu|hun|hoo)", r"rha (?:hoon|hu|hun)", r"(?:karta|jata|aata|khata|sota|padhta|rehta|sochta|"
+    r"dekhta|bolta|chahta|lagta|janta|samajhta) (?:hoon|hu|hun)", r"(?:sakta|wala|gaya|aaya|hua) (?:hoon|hu|hun)",
+    r"(?:karunga|jaunga|aaunga|dunga|lunga|bataunga|milunga|sounga|khaunga|dekhunga|bolunga|rahunga)",
+    r"i'?m a (?:boy|guy|man|dude)", r"i am a (?:boy|guy|man)", r"as a (?:boy|guy|man)",
+]
+_SELF_FEMALE = [
+    r"rahi (?:hoon|hu|hun|hoo)", r"rhi (?:hoon|hu|hun)", r"(?:karti|jati|aati|khati|soti|padhti|rehti|sochti|"
+    r"dekhti|bolti|chahti|lagti|janti|samajhti) (?:hoon|hu|hun)", r"(?:sakti|wali|gayi|gyi|aayi|hui) (?:hoon|hu|hun)",
+    r"(?:karungi|jaungi|aaungi|dungi|lungi|bataungi|milungi|soungi|khaungi|dekhungi|bolungi|rahungi)",
+    r"i'?m a (?:girl|woman|lady)", r"i am a (?:girl|woman|lady)", r"as a (?:girl|woman|lady)",
+]
+# How others address someone they reply to or mention.
+_ADDRESS_MALE = [r"bro", r"bruh", r"bhai", r"bhaiya", r"bhaii+", r"dude", r"sir", r"king", r"brother"]
+_ADDRESS_FEMALE = [r"sis", r"sister", r"didi", r"behen", r"behna", r"ma'?am", r"queen", r"madam"]
+
+
+def _compile(patterns: list[str]) -> re.Pattern[str]:
+    return re.compile(r"(?<![a-z])(?:" + "|".join(patterns) + r")(?![a-z])")
+
+
+_SELF_MALE_RE = _compile(_SELF_MALE)
+_SELF_FEMALE_RE = _compile(_SELF_FEMALE)
+_ADDRESS_MALE_RE = _compile(_ADDRESS_MALE)
+_ADDRESS_FEMALE_RE = _compile(_ADDRESS_FEMALE)
+
+
+def self_gender_votes(text: str) -> tuple[float, float]:
+    """Votes about the *author's* gender from how they describe themselves."""
+    lowered = (text or "").lower()
+    return (float(len(_SELF_MALE_RE.findall(lowered))), float(len(_SELF_FEMALE_RE.findall(lowered))))
+
+
+def address_gender_votes(text: str) -> tuple[float, float]:
+    """Votes about the *person being talked to* (reply/mention target), weaker evidence."""
+    lowered = (text or "").lower()
+    male = 0.5 if _ADDRESS_MALE_RE.search(lowered) else 0.0
+    female = 0.5 if _ADDRESS_FEMALE_RE.search(lowered) else 0.0
+    return male, female
+
+
+def resolve_gender(votes: Any, *, min_votes: float = 2.0, min_share: float = 0.75) -> str | None:
+    """Turn saved votes {"male": x, "female": y} into a guess, or None when unsure."""
+    if not isinstance(votes, dict):
+        return None
+    try:
+        male = float(votes.get("male", 0.0) or 0.0)
+        female = float(votes.get("female", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    total = male + female
+    if total < min_votes:
+        return None
+    if male / total >= min_share:
+        return "male"
+    if female / total >= min_share:
+        return "female"
+    return None
+
+
 @dataclass
 class CrushCandidate:
     user_id: int
@@ -114,7 +177,10 @@ def rank_crush_candidates(
     is_eligible: Callable[[int], bool] = lambda _uid: True,
     limit: int = 3,
 ) -> tuple[list[CrushCandidate], dict[str, int]]:
-    """Rank who `target_id` flirts with most, keeping only the opposite gender when known.
+    """Rank who `target_id` flirts with most.
+
+    When both genders are known, people of the same gender as the target are left out.
+    People whose gender is unknown are kept, so nothing depends on server setup.
 
     `edges` is the saved graph: edges[str(source)][str(dest)] -> counters, including
     `flirt_score` / `flirt_count` written by the indexer.
@@ -136,8 +202,7 @@ def rank_crush_candidates(
             candidate_ids.add(int(source_key))
     candidate_ids.discard(target_id)
 
-    wanted_gender = opposite_gender(target_gender)
-    stats = {"considered": 0, "wrong_gender": 0, "unknown_gender": 0}
+    stats = {"considered": 0, "same_gender": 0, "unknown_gender": 0}
     ranked: list[CrushCandidate] = []
     for uid in candidate_ids:
         if not is_eligible(uid):
@@ -150,13 +215,11 @@ def rank_crush_candidates(
             continue
         stats["considered"] += 1
         gender = gender_of(uid)
-        if wanted_gender is not None:
-            if gender is None:
-                stats["unknown_gender"] += 1
-                continue
-            if gender != wanted_gender:
-                stats["wrong_gender"] += 1
-                continue
+        if gender is None:
+            stats["unknown_gender"] += 1
+        elif target_gender is not None and gender == target_gender:
+            stats["same_gender"] += 1
+            continue
         interactions = _edge_num(out_edge, "score") + _edge_num(in_edge, "score")
         score = (
             sent * 1.0
