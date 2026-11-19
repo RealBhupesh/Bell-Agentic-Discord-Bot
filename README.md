@@ -85,6 +85,7 @@ Someone joins your server and starts reading through a member's old chats. That 
   - `&roast @user [soft|friendly|brutal]`
   - `&serverlore`
   - `&aicrush @user`
+  - `&crush [@user]` / `/crush`: who they flirt with most (opposite gender, using gender roles). History is read once and saved, so repeat checks are instant.
   - `&analyze @user`
   - `&lie_detector @user <message>`
   - `&futureme`

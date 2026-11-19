@@ -23,6 +23,7 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+import flirt_crush
 import message_wipe
 
 try:
@@ -3549,6 +3550,9 @@ async def flush_aicrush_state(force: bool = False) -> None:
             pass
 
 
+AICRUSH_FLIRT_INDEX_VERSION = 1
+
+
 def get_guild_aicrush_state(guild_id: int) -> dict[str, Any]:
     state = get_aicrush_state()
     guilds = state.setdefault("guilds", {})
@@ -3564,6 +3568,13 @@ def get_guild_aicrush_state(guild_id: int) -> dict[str, Any]:
     for field in ("channels", "users", "edges", "meta"):
         if not isinstance(guild_state.get(field), dict):
             guild_state[field] = {}
+    if guild_state["meta"].get("flirt_index_version") != AICRUSH_FLIRT_INDEX_VERSION:
+        # Older saved indexes have no flirt counts; start over once so history is re-read with them.
+        guild_state["channels"] = {}
+        guild_state["users"] = {}
+        guild_state["edges"] = {}
+        guild_state["meta"] = {"flirt_index_version": AICRUSH_FLIRT_INDEX_VERSION}
+        _mark_aicrush_dirty()
     meta = guild_state["meta"]
     meta.setdefault("messages_indexed", 0)
     meta.setdefault("last_backfill_ts", 0.0)
@@ -5426,6 +5437,22 @@ def _aicrush_update_edge(
     _aicrush_append_unique_sample(samples, sample_text, 6)
 
 
+def _aicrush_add_flirt(
+    guild_state: dict[str, Any],
+    source_id: int,
+    target_id: int,
+    *,
+    amount: float,
+    created_ts: float,
+) -> None:
+    if source_id == target_id or amount <= 0:
+        return
+    row = _aicrush_get_edge_row(guild_state, source_id, target_id)
+    row["flirt_score"] = round(float(row.get("flirt_score", 0.0) or 0.0) + amount, 4)
+    row["flirt_count"] = int(row.get("flirt_count", 0) or 0) + 1
+    row["flirt_last_ts"] = max(float(row.get("flirt_last_ts", 0.0) or 0.0), created_ts)
+
+
 def _aicrush_extract_name_hit_targets(
     guild: discord.Guild,
     author_id: int,
@@ -5489,6 +5516,8 @@ def _aicrush_invalidate_result_cache(guild_id: int, user_ids: set[int]) -> None:
     for cache_key in list(AICRUSH_RESULT_CACHE.keys()):
         if cache_key[0] == guild_id and cache_key[1] in user_ids:
             AICRUSH_RESULT_CACHE.pop(cache_key, None)
+    for user_id in user_ids:
+        FLIRT_CRUSH_CACHE.pop((guild_id, user_id), None)
 
 
 def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -> set[int]:
@@ -5588,12 +5617,37 @@ def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -
         impacted_ids.add(reply_target_id)
 
     normalized_content = normalize_aicrush_text(content)
-    for target_id, hit_score in _aicrush_extract_name_hit_targets(
+    name_hits = _aicrush_extract_name_hit_targets(
         message.guild,
         member.id,
         normalized_content,
         direct_target_ids=direct_target_ids,
-    ).items():
+    )
+
+    flirt_amount = flirt_crush.flirt_score(message.content or content)
+    if flirt_amount > 0:
+        flirt_targets: dict[int, float] = {}
+        if reply_target_id is not None and reply_target_id != member.id:
+            flirt_targets[reply_target_id] = 1.0
+        for target_id in direct_target_ids:
+            flirt_targets[target_id] = max(flirt_targets.get(target_id, 0.0), 1.0)
+        for target_id in name_hits:
+            flirt_targets[target_id] = max(flirt_targets.get(target_id, 0.0), 0.8)
+        if not flirt_targets and 1 <= len(recent_others) <= 2:
+            # No reply/mention: credit whoever they're chatting with right now.
+            for other_id in recent_others:
+                flirt_targets[other_id] = 0.5 / len(recent_others)
+        for target_id, weight in flirt_targets.items():
+            _aicrush_add_flirt(
+                guild_state,
+                member.id,
+                target_id,
+                amount=flirt_amount * weight,
+                created_ts=created_ts,
+            )
+            impacted_ids.add(target_id)
+
+    for target_id, hit_score in name_hits.items():
         _aicrush_update_edge(
             guild_state,
             member.id,
@@ -17754,6 +17808,7 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}psych [start|stop|reset|status] [message]` - Listen-first psych mode (replies after pause, asks before advice).\n"
         f"`{PREFIX}roast <@user> [soft|friendly|brutal]` - Personal roast from server-wide chat patterns.\n"
         f"`{PREFIX}serverlore`, `{PREFIX}aicrush <@user>`, `{PREFIX}analyze <@user>`\n"
+        f"`{PREFIX}crush [@user]` (or `/crush`) - Who they flirt with most (opposite gender), saved and instant on repeat.\n"
         f"`{PREFIX}lie_detector <@user> <message>`, `{PREFIX}futureme`\n"
         f"`{PREFIX}rizzcoach [smooth|funny|mysterious] <message>`\n"
         f"`{PREFIX}argument <topic>` - starts persistent argument mode (`bell stop argument` to end).\n"
@@ -21588,6 +21643,136 @@ async def arcreport_command(
     )
     SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
     await send_chunked(ctx, result)
+
+
+FLIRT_CRUSH_CACHE: dict[tuple[int, int], dict[str, Any]] = {}
+FLIRT_CRUSH_SCAN_LOCKS: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def _flirt_crush_coverage(guild: discord.Guild) -> tuple[int, int]:
+    guild_state = get_guild_aicrush_state(guild.id)
+    channel_rows = guild_state.get("channels", {})
+    readable = get_readable_text_channels(guild)
+    if AICRUSH_MAX_CHANNELS > 0:
+        readable = readable[:AICRUSH_MAX_CHANNELS]
+    done = sum(
+        1
+        for channel in readable
+        if isinstance(channel_rows.get(str(channel.id)), dict)
+        and bool(channel_rows[str(channel.id)].get("fully_scanned"))
+    )
+    return done, len(readable)
+
+
+def build_flirt_crush_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    guild_state = get_guild_aicrush_state(guild.id)
+    target_gender = detect_member_gender_from_roles(member)
+
+    def eligible(uid: int) -> bool:
+        other = guild.get_member(uid)
+        return other is not None and not other.bot
+
+    def gender_of(uid: int) -> str | None:
+        other = guild.get_member(uid)
+        return detect_member_gender_from_roles(other) if other is not None else None
+
+    candidates, stats = flirt_crush.rank_crush_candidates(
+        member.id,
+        target_gender,
+        guild_state.get("edges", {}),
+        gender_of,
+        is_eligible=eligible,
+        limit=3,
+    )
+    done, total = _flirt_crush_coverage(guild)
+    indexed = int(guild_state.get("meta", {}).get("messages_indexed", 0) or 0)
+
+    embed = discord.Embed(title=f"💘 {member.display_name}'s crush", color=discord.Color.from_rgb(255, 92, 141))
+    top = candidates[0] if candidates else None
+    if top is None or top.flirt_sent_score <= 0:
+        lines = [f"I haven't seen {member.mention} flirt with anyone yet."]
+        if top is not None:
+            lines.append(f"But <@{top.user_id}> has been flirting with **them** 👀")
+        if stats["wrong_gender"] or stats["unknown_gender"]:
+            lines.append(
+                f"(Skipped {stats['wrong_gender'] + stats['unknown_gender']} people who aren't the opposite gender "
+                "or have no gender role.)"
+            )
+        embed.description = "\n".join(lines)
+    else:
+        confidence = flirt_crush.crush_confidence(candidates)
+        embed.description = f"## <@{top.user_id}>\nConfidence: **{confidence}%**" + (
+            "\n💞 **It's mutual** — they flirt back!" if top.mutual else ""
+        )
+        embed.add_field(
+            name="Flirty messages",
+            value=(
+                f"{member.display_name} → them: **{top.flirts_sent}**\n"
+                f"them → {member.display_name}: **{top.flirts_received}**"
+            ),
+            inline=False,
+        )
+        runners = [c for c in candidates[1:] if c.flirt_sent_score > 0]
+        if runners:
+            embed.add_field(
+                name="Also flirting with",
+                value="\n".join(
+                    f"<@{c.user_id}> — {c.flirts_sent} sent / {c.flirts_received} back" for c in runners
+                ),
+                inline=False,
+            )
+    notes: list[str] = []
+    if target_gender is None:
+        notes.append(
+            f"I couldn't tell {member.display_name}'s gender from their roles, so everyone is included. "
+            f"A mod can fix this with `{PREFIX}setgenderroles @male_role @female_role`."
+        )
+    elif stats["unknown_gender"]:
+        notes.append(f"{stats['unknown_gender']} people were skipped because they have no gender role.")
+    if done < total:
+        notes.append(f"Still reading older history ({done}/{total} channels done). Run it again to include more.")
+    notes.append("Only server channels are read, not DMs.")
+    embed.add_field(name="Notes", value="\n".join(notes)[:1024], inline=False)
+    embed.set_footer(text=f"Based on {indexed:,} saved messages · For fun only")
+    return embed
+
+
+@bot.hybrid_command(name="crush", aliases=["flirtcrush"])
+@commands.cooldown(3, 30, commands.BucketType.user)
+@commands.guild_only()
+@discord.app_commands.describe(member="Whose crush to find (leave empty for yourself)")
+async def crush_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    guild = ctx.guild
+    member = member or ctx.author
+    if not isinstance(member, discord.Member) or member.bot:
+        await ctx.send("This command is for server members only.")
+        return
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+
+    cache_key = (guild.id, member.id)
+    done, total = _flirt_crush_coverage(guild)
+    history_complete = total > 0 and done >= total
+    cached = FLIRT_CRUSH_CACHE.get(cache_key)
+    if cached is not None and history_complete:
+        await ctx.send(embed=discord.Embed.from_dict(cached))
+        return
+
+    async with ctx.typing():
+        if not history_complete:
+            lock = FLIRT_CRUSH_SCAN_LOCKS[guild.id]
+            async with lock:
+                await run_aicrush_backfill(
+                    guild,
+                    message_budget=AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES,
+                    time_budget_seconds=AICRUSH_COMMAND_MAX_BACKFILL_SECONDS,
+                )
+        embed = build_flirt_crush_embed(guild, member)
+
+    done, total = _flirt_crush_coverage(guild)
+    if total > 0 and done >= total:
+        FLIRT_CRUSH_CACHE[cache_key] = embed.to_dict()
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(name="aicrush")
