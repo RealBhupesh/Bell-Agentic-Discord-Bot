@@ -2,12 +2,52 @@
 
 Discord moderation bot with prefix commands (default: `&`).
 
+## 🧹 Message Wipe — remove one person's history, fast
+
+Someone joins your server and starts reading through a member's old chats. That member may have thousands of messages, far too many to delete by hand, and getting themselves banned shouldn't be the only way out. **Message Wipe** finds every message one person sent across the server and deletes it in one go. Filters let you pick exactly which messages go.
+
+```
+&wipe <@user | user_id> [amount | all] [filters…]      (also /wipe with a user picker)
+&wipeme [amount | all] [filters…]                       (members wipe their own messages, if enabled)
+&wipestop        &selfwipe <on|off|status>        &wipehelp
+```
+
+**How it works**
+1. Bell scans the channels you choose and shows live progress, with a **Stop** button.
+2. You get a **preview**: how many messages matched, which channels they're in, the date range, and an estimated time.
+3. Nothing is deleted until you press **Delete**. Messages under 14 days old are bulk-deleted 100 at a time; older ones are deleted one by one in the background.
+4. A summary goes to the mod-log. **Message contents are never logged.**
+
+**Filters** (combine freely)
+
+| What | Syntax |
+|---|---|
+| Channels (default: all) | `#general #memes`, `in:general,memes`, `here`, `archived` (include archived threads) |
+| Skip channels | `-#rules`, `exclude:announcements` |
+| Message type (any of) | `text` `links` `invites` `attachments`/`files` `images` `videos` `audio` `embeds` `stickers` `mentions` `replies` `emoji` |
+| Exclude a type | `-images`, `no:links` |
+| Words | `contains:"my address"` (repeat = any of), `except:"keep this"`, `regex:pattern` |
+| Time | `newer:7d`, `older:30d` (`s m h d w mo y`), `after:2025-01-01`, `before:2025-06-30` |
+| Length | `minlen:5`, `maxlen:200` |
+| Other | `pinned` (pinned messages are kept unless you add this), `preview` (count only), `scan:5000` (max messages read per channel) |
+
+**Examples**
+```
+&wipe @someone all                                   # everything they ever sent
+&wipe @someone 500 #general images links             # their newest 500 images/links in #general
+&wipe 123456789012345678 all older:30d -#announcements   # works even after they left the server
+&wipeme all contains:"my number" preview             # see how many of your messages mention it
+```
+
+**Safety:** `&wipe` needs *Manage Messages*, and it only scans channels where both you and Bell have that permission. You can't wipe someone whose top role is equal to or higher than yours, or the server owner. Only one wipe runs per server at a time. `&wipeme` is **off by default**; a server manager turns it on with `&selfwipe on`, and each member can use it once every 10 minutes.
+
 ## Features
 
 - `&pb`: deletes bot/webhook messages from the most recent 20 messages in the current channel.
 - `&pba`: deletes all bot/webhook messages from the current channel.
 - `&clear <amount>`: bulk deletes recent messages.
 - `&bulkdelete <#channel> <amount>`: bulk deletes messages in a specific channel.
+- `&wipe <@user|id> [amount|all] [filters]` / `&wipeme`: delete one person's messages across the server with filters (see **Message Wipe** above).
 - `&kick`, `&ban`, `&unban`
 - `&mute`, `&unmute` (Discord timeout based)
 - `&lock`, `&unlock`, `&slowmode`
@@ -148,6 +188,9 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `AICRUSH_SCAN_PAUSE_SECONDS=0.12` (sleep duration for pacing)
 - `AICRUSH_CACHE_SECONDS=900` (reuse recent result to avoid repeated scans)
 - `BUSINESS_ENABLED=true`
+- `WIPE_MAX_AMOUNT=100000` (largest number accepted for `&wipe <amount>`)
+- `WIPE_CONFIRM_TIMEOUT_SECONDS=180`
+- `WIPE_SELF_SERVICE_ENABLED=false` (default for `&selfwipe` when a server hasn't set it)
 - `BUSINESS_STATE_FLUSH_SECONDS=30`
 - `BUSINESS_GLOBAL_MODE=true`
 - `BUSINESS_STARTER_CASH=10000`

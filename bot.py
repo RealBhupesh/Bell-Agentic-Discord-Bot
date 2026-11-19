@@ -11,7 +11,7 @@ import hashlib
 import copy
 import unicodedata
 import difflib
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from dataclasses import dataclass
 from collections import Counter, defaultdict, deque
 from datetime import timedelta, datetime, timezone
@@ -22,6 +22,8 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+
+import message_wipe
 
 try:
     import yt_dlp
@@ -13494,7 +13496,7 @@ def _capability_domain_from_command(command_name: str, aliases: list[str]) -> st
         "pb", "pba", "clear", "bulkdelete", "kick", "ban", "unban", "mute", "unmute",
         "lock", "unlock", "slowmode", "warn", "warnings", "clearwarns", "setmodlog",
         "clearmodlog", "reloadbadwords", "automod", "aiguard", "aimodmode", "modqueue",
-        "case", "override", "appeal", "modguard", "escalation",
+        "case", "override", "appeal", "modguard", "escalation", "wipe", "wipestop", "selfwipe",
     }
     music = {"join", "leave", "play", "skip", "pause", "resume", "stop", "queue", "nowplaying"}
     business = {
@@ -13539,7 +13541,7 @@ def _capability_mod_only_from_command(command: commands.Command, command_name: s
         "case", "override", "modguard", "escalation", "setgenderroles", "genderroles",
         "cleargenderroles", "welcomeconcierge", "setintrochannel", "clearintrochannel",
         "engagementlimits", "engagementhub", "autoloops", "questmode", "engagementtz",
-        "markethalt", "serverinsights", "say",
+        "markethalt", "serverinsights", "say", "wipe", "wipestop", "selfwipe",
     }
     if command_name in known_mod_only:
         return True
@@ -14066,6 +14068,7 @@ BOT_GUIDE_KB: list[dict[str, object]] = [
         ),
         "content": (
             f"Cleanup: `{PREFIX}pb`, `{PREFIX}pba`, `{PREFIX}clear <amount>`, `{PREFIX}bulkdelete <#channel> <amount>`.\n"
+            f"User wipe: `{PREFIX}wipe <@user|id> [amount|all] [filters]` deletes one person's messages across channels with filters (`{PREFIX}wipehelp`).\n"
             f"Member actions: `{PREFIX}mute`, `{PREFIX}unmute`, `{PREFIX}kick`, `{PREFIX}ban`, `{PREFIX}unban`.\n"
             f"Channel controls: `{PREFIX}lock`, `{PREFIX}unlock`, `{PREFIX}slowmode`.\n"
             f"AutoMod controls: `{PREFIX}automod <on|off|status>` and conversational `bell turn on automod`."
@@ -17651,6 +17654,8 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}pba` - Delete all bot/webhook messages from this channel.\n"
         f"`{PREFIX}clear <amount>` - Delete recent messages.\n"
         f"`{PREFIX}bulkdelete <#channel> <amount>` - Bulk delete from a specific channel.\n"
+        f"`{PREFIX}wipe <@user|id> [amount|all] [filters]` - Delete one user's messages server-wide with filters. See `{PREFIX}wipehelp`.\n"
+        f"`{PREFIX}wipeme [amount|all] [filters]` - Wipe your own messages (when `{PREFIX}selfwipe on`). `{PREFIX}wipestop` stops a wipe.\n"
         f"`{PREFIX}kick <@member> [reason]`\n"
         f"`{PREFIX}ban <@member> [reason]`\n"
         f"`{PREFIX}unban <user_id> [reason]`\n"
@@ -22549,6 +22554,525 @@ async def bulk_delete_messages(
         channel=channel,
         details=f"Deleted: `{total_deleted}`",
     )
+
+
+# --------------------------------------------------------------------------------------
+# Targeted message wipe (&wipe / /wipe, &wipeme, &wipestop, &selfwipe)
+# --------------------------------------------------------------------------------------
+
+WIPE_MAX_AMOUNT = env_int("WIPE_MAX_AMOUNT", 100000, 1)
+WIPE_CONFIRM_TIMEOUT_SECONDS = env_int("WIPE_CONFIRM_TIMEOUT_SECONDS", 180, 30)
+WIPE_SELF_SERVICE_DEFAULT = env_bool("WIPE_SELF_SERVICE_ENABLED", False)
+WIPE_JOBS: dict[int, message_wipe.WipeJob] = {}
+
+
+def get_guild_self_wipe_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    value = config.get(str(guild_id), {}).get("self_wipe_enabled")
+    if isinstance(value, bool):
+        return value
+    return WIPE_SELF_SERVICE_DEFAULT
+
+
+def set_guild_self_wipe_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["self_wipe_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def _wipe_channel_resolver(guild: discord.Guild) -> Callable[[str], int | None]:
+    def resolve(raw: str) -> int | None:
+        text = raw.strip()
+        mention = re.fullmatch(r"<#(\d{15,25})>", text)
+        if mention:
+            return int(mention.group(1))
+        if text.isdigit():
+            channel = guild.get_channel_or_thread(int(text))
+            return channel.id if channel else None
+        name = text.lstrip("#").lower()
+        for channel in [*guild.channels, *guild.threads]:
+            if channel.name.lower() == name:
+                return channel.id
+        return None
+
+    return resolve
+
+
+async def collect_wipe_channels(
+    guild: discord.Guild,
+    filters: message_wipe.WipeFilters,
+    *,
+    invoker: discord.Member,
+    here_channel: discord.abc.GuildChannel | discord.Thread | None,
+    self_service: bool,
+) -> tuple[list[Any], list[str]]:
+    candidates: list[Any] = [*guild.text_channels, *guild.voice_channels, *guild.stage_channels]
+    candidates.extend(guild.threads)
+    if filters.include_archived_threads:
+        seen = {c.id for c in candidates}
+        for parent in [*guild.text_channels, *guild.forums]:
+            try:
+                async for thread in parent.archived_threads(limit=None):
+                    if thread.id not in seen:
+                        seen.add(thread.id)
+                        candidates.append(thread)
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+    if filters.only_here and here_channel is not None:
+        selected = {here_channel.id}
+    else:
+        selected = set(filters.channel_ids)
+
+    def in_set(channel: Any, ids: set[int]) -> bool:
+        return channel.id in ids or getattr(channel, "parent_id", None) in ids
+
+    me = guild.me
+    chosen: list[Any] = []
+    skipped: list[str] = []
+    for channel in candidates:
+        if selected and not in_set(channel, selected):
+            continue
+        if filters.exclude_channel_ids and in_set(channel, filters.exclude_channel_ids):
+            continue
+        bot_perms = channel.permissions_for(me)
+        if not (bot_perms.view_channel and bot_perms.read_message_history and bot_perms.manage_messages):
+            if selected:
+                skipped.append(channel.mention)
+            continue
+        if not self_service and not channel.permissions_for(invoker).manage_messages:
+            if selected:
+                skipped.append(channel.mention)
+            continue
+        chosen.append(channel)
+    return chosen, skipped
+
+
+def build_wipe_embed(
+    job: message_wipe.WipeJob,
+    target: discord.abc.User,
+    *,
+    title: str,
+    color: discord.Color,
+    note: str | None = None,
+    show_breakdown: bool = False,
+    guild: discord.Guild | None = None,
+) -> discord.Embed:
+    embed = discord.Embed(title=title, color=color, timestamp=discord.utils.utcnow())
+    embed.add_field(name="User", value=f"{target.mention} (`{target.id}`)", inline=False)
+
+    def label(channel_id: int) -> str:
+        return f"<#{channel_id}>"
+
+    embed.add_field(
+        name="Filters",
+        value="\n".join(job.filters.describe(label))[:1024],
+        inline=False,
+    )
+    amount_text = "all matching" if job.amount is None else f"newest {job.amount}"
+    progress_lines = [
+        f"Amount: **{amount_text}**",
+        f"Channels scanned: **{job.channels_done}/{job.channels_total}**",
+        f"Messages checked: **{job.scanned:,}**",
+        f"Matches found: **{len(job.matches):,}**",
+    ]
+    if job.phase != "scanning" and (job.deleted or job.failed):
+        progress_lines.append(f"Deleted: **{job.deleted:,}**" + (f" (failed: {job.failed})" if job.failed else ""))
+    embed.add_field(name="Progress", value="\n".join(progress_lines), inline=False)
+
+    if show_breakdown and job.matches:
+        counts = sorted(job.per_channel_counts().items(), key=lambda item: item[1], reverse=True)
+        lines = [f"<#{cid}> — **{count:,}**" for cid, count in counts[:12]]
+        if len(counts) > 12:
+            rest = sum(count for _, count in counts[12:])
+            lines.append(f"…and {len(counts) - 12} more channels — **{rest:,}**")
+        embed.add_field(name="Where", value="\n".join(lines)[:1024], inline=False)
+        recent, old = job.split_by_age()
+        oldest = min(m.created_at for m in job.matches)
+        newest = max(m.created_at for m in job.matches)
+        embed.add_field(
+            name="Details",
+            value=(
+                f"Range: {discord.utils.format_dt(oldest, 'd')} → {discord.utils.format_dt(newest, 'd')}\n"
+                f"Fast bulk delete (<14 days old): **{recent:,}**\n"
+                f"One-by-one delete (older): **{old:,}**\n"
+                f"Estimated time: **{message_wipe.format_eta(job.eta_seconds())}**"
+            ),
+            inline=False,
+        )
+    if job.skipped_channels:
+        embed.add_field(
+            name="Skipped (missing permissions)",
+            value=", ".join(job.skipped_channels[:15])[:1024],
+            inline=False,
+        )
+    if note:
+        embed.add_field(name="​", value=note[:1024], inline=False)
+    embed.set_footer(text="Message contents are never logged.")
+    return embed
+
+
+class WipeConfirmView(discord.ui.View):
+    def __init__(self, invoker_id: int, count: int) -> None:
+        super().__init__(timeout=WIPE_CONFIRM_TIMEOUT_SECONDS)
+        self.invoker_id = invoker_id
+        self.confirmed: bool | None = None
+        self.confirm_button.label = f"Delete {count:,} messages"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the person who started this wipe can confirm it.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🧹")
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.confirmed = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.confirmed = False
+        await interaction.response.defer()
+        self.stop()
+
+
+class WipeStopView(discord.ui.View):
+    def __init__(self, job: message_wipe.WipeJob, invoker_id: int) -> None:
+        super().__init__(timeout=None)
+        self.job = job
+        self.invoker_id = invoker_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user
+        if member.id == self.invoker_id:
+            return True
+        if isinstance(member, discord.Member) and is_moderator(member):
+            return True
+        await interaction.response.send_message("You can't stop this wipe.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.secondary, emoji="⏹️")
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.job.cancel_event.set()
+        button.disabled = True
+        button.label = "Stopping…"
+        await interaction.response.edit_message(view=self)
+
+
+def check_wipe_hierarchy(
+    guild: discord.Guild, moderator: discord.Member, target: discord.abc.User
+) -> str | None:
+    if target.id == moderator.id or moderator.id == guild.owner_id:
+        return None
+    if target.id == guild.owner_id:
+        return "You can't wipe the server owner's messages."
+    target_member = guild.get_member(target.id)
+    if target_member is not None and target_member.top_role >= moderator.top_role:
+        return "That member's top role is equal to or higher than yours, so you can't wipe their messages."
+    return None
+
+
+async def run_message_wipe(
+    ctx: commands.Context,
+    target: discord.abc.User,
+    amount_raw: str | None,
+    filters_raw: str | None,
+    *,
+    self_service: bool,
+) -> None:
+    guild = ctx.guild
+    invoker = ctx.author
+    if guild is None or not isinstance(invoker, discord.Member):
+        await ctx.send("This command only works inside a server.")
+        return
+
+    if amount_raw is not None and not message_wipe.looks_like_amount(amount_raw):
+        filters_raw = f"{amount_raw} {filters_raw or ''}".strip()
+        amount_raw = None
+    try:
+        amount = message_wipe.parse_amount(amount_raw, maximum=WIPE_MAX_AMOUNT)
+        filters = message_wipe.parse_filters(filters_raw, resolve_channel=_wipe_channel_resolver(guild))
+    except message_wipe.WipeFilterError as exc:
+        await ctx.send(f"❌ {exc}\nSee `{PREFIX}wipehelp` for the filter list.")
+        return
+
+    if not self_service:
+        problem = check_wipe_hierarchy(guild, invoker, target)
+        if problem:
+            await ctx.send(f"❌ {problem}")
+            return
+
+    existing = WIPE_JOBS.get(guild.id)
+    if existing is not None:
+        await ctx.send(
+            f"A wipe is already running in this server (for <@{existing.target_id}>). "
+            f"Wait for it to finish or use `{PREFIX}wipestop`."
+        )
+        return
+
+    here = ctx.channel if isinstance(ctx.channel, (discord.abc.GuildChannel, discord.Thread)) else None
+    channels, skipped = await collect_wipe_channels(
+        guild, filters, invoker=invoker, here_channel=here, self_service=self_service
+    )
+    if not channels:
+        await ctx.send(
+            "❌ No channels to scan. I need `View Channel`, `Read Message History` and "
+            "`Manage Messages` there"
+            + ("" if self_service else ", and so do you")
+            + "."
+        )
+        return
+
+    job = message_wipe.WipeJob(
+        guild_id=guild.id,
+        target_id=target.id,
+        moderator_id=invoker.id,
+        self_service=self_service,
+        filters=filters,
+        amount=amount,
+    )
+    job.skipped_channels.extend(skipped)
+    WIPE_JOBS[guild.id] = job
+
+    try:
+        if ctx.interaction is not None:
+            # Interaction follow-ups can only be edited for 15 minutes; long wipes need a
+            # normal channel message for live progress.
+            await ctx.send("🧹 Scanning — live status is posted below.", ephemeral=True)
+            send_status = ctx.channel.send
+        else:
+            send_status = ctx.send
+
+        stop_view = WipeStopView(job, invoker.id)
+        status = await send_status(
+            embed=build_wipe_embed(job, target, title="🔎 Scanning messages…", color=discord.Color.blurple()),
+            view=stop_view,
+        )
+
+        async def safe_edit(**kwargs: Any) -> None:
+            try:
+                await status.edit(**kwargs)
+            except discord.HTTPException:
+                pass
+
+        async def scan_progress(current: message_wipe.WipeJob) -> None:
+            await safe_edit(
+                embed=build_wipe_embed(current, target, title="🔎 Scanning messages…", color=discord.Color.blurple())
+            )
+
+        ignore_ids = {status.id}
+        if ctx.message is not None and not self_service:
+            ignore_ids.add(ctx.message.id)
+        await message_wipe.scan_channels(job, channels, progress=scan_progress, ignore_message_ids=ignore_ids)
+
+        if job.cancelled:
+            job.phase = "cancelled"
+            await safe_edit(
+                embed=build_wipe_embed(job, target, title="⏹️ Wipe stopped during scan", color=discord.Color.dark_grey(),
+                                       note="Nothing was deleted."),
+                view=None,
+            )
+            return
+
+        if not job.matches:
+            job.phase = "done"
+            await safe_edit(
+                embed=build_wipe_embed(job, target, title="✅ No matching messages", color=discord.Color.green(),
+                                       note="Nothing to delete with these filters."),
+                view=None,
+            )
+            return
+
+        if filters.preview_only:
+            job.phase = "done"
+            await safe_edit(
+                embed=build_wipe_embed(job, target, title="👀 Preview only", color=discord.Color.gold(),
+                                       note="Dry run — nothing was deleted. Remove `preview` to actually wipe.",
+                                       show_breakdown=True),
+                view=None,
+            )
+            return
+
+        confirm_view = WipeConfirmView(invoker.id, len(job.matches))
+        await safe_edit(
+            embed=build_wipe_embed(
+                job, target, title="⚠️ Confirm wipe", color=discord.Color.orange(),
+                note=f"{invoker.mention}, press **Delete** to permanently remove these messages. "
+                     f"This can't be undone. Expires in {WIPE_CONFIRM_TIMEOUT_SECONDS}s.",
+                show_breakdown=True,
+            ),
+            view=confirm_view,
+        )
+        await confirm_view.wait()
+        if not confirm_view.confirmed:
+            job.phase = "cancelled"
+            await safe_edit(
+                embed=build_wipe_embed(job, target, title="❎ Wipe cancelled", color=discord.Color.dark_grey(),
+                                       note="Nothing was deleted.", show_breakdown=True),
+                view=None,
+            )
+            return
+
+        stop_view = WipeStopView(job, invoker.id)
+
+        async def delete_progress(current: message_wipe.WipeJob) -> None:
+            await safe_edit(
+                embed=build_wipe_embed(current, target, title="🧹 Deleting…", color=discord.Color.red(),
+                                       show_breakdown=True)
+            )
+
+        await safe_edit(
+            embed=build_wipe_embed(job, target, title="🧹 Deleting…", color=discord.Color.red(), show_breakdown=True),
+            view=stop_view,
+        )
+        reason = f"Message wipe by {invoker} ({invoker.id})" + (" [self-service]" if self_service else "")
+        channels_by_id = {channel.id: channel for channel in channels}
+        await message_wipe.delete_matches(job, channels_by_id, progress=delete_progress, reason=reason)
+
+        stopped = job.phase == "cancelled"
+        final_title = "⏹️ Wipe stopped" if stopped else "✅ Wipe complete"
+        final_note = (
+            f"Stopped after deleting {job.deleted:,} of {len(job.matches):,}." if stopped
+            else f"Deleted {job.deleted:,} of {len(job.matches):,} messages."
+        )
+        final_embed = build_wipe_embed(
+            job, target, title=final_title,
+            color=discord.Color.dark_grey() if stopped else discord.Color.green(),
+            note=final_note, show_breakdown=True,
+        )
+        try:
+            await status.edit(embed=final_embed, view=None)
+        except discord.HTTPException:
+            try:
+                await ctx.channel.send(embed=final_embed)
+            except discord.HTTPException:
+                pass
+
+        await send_mod_log(
+            guild,
+            "Message Wipe (self-service)" if self_service else "Message Wipe",
+            target=target,
+            moderator=invoker,
+            details=(
+                f"Deleted: `{job.deleted}` / matched `{len(job.matches)}`"
+                + (f", failed `{job.failed}`" if job.failed else "")
+                + (" (stopped early)" if stopped else "")
+                + f"\nChannels touched: `{len(job.per_channel_counts())}`\n"
+                + "\n".join(filters.describe())[:800]
+            ),
+        )
+    finally:
+        WIPE_JOBS.pop(guild.id, None)
+
+
+WIPE_HELP_TEXT = (
+    "**🧹 Message Wipe** — delete one person's messages across the server, with filters.\n"
+    f"`{PREFIX}wipe <@user|id> [amount|all] [filters…]` *(mods, also `/wipe`)*\n"
+    f"`{PREFIX}wipeme [amount|all] [filters…]` — wipe your own messages (if `{PREFIX}selfwipe on`)\n"
+    f"`{PREFIX}wipestop` — stop the running wipe · `{PREFIX}selfwipe <on|off|status>`\n"
+    "You always get a preview with per-channel counts and a **Delete** button first.\n\n"
+    "**Channels** (default: all channels I can manage)\n"
+    "`#general #memes` or `in:general,memes` · `-#rules` or `exclude:rules` · `here` · `archived` (include archived threads)\n"
+    "**Type** (any of these — OR)\n"
+    "`text` `links` `invites` `attachments`/`files` `images` `videos` `audio` `embeds` `stickers` `mentions` `replies` `emoji`\n"
+    "Exclude a type with `-images` or `no:links`.\n"
+    "**Content**\n"
+    "`contains:\"some words\"` (repeat for any-of) · `except:\"keep this\"` · `regex:pattern` · `minlen:5` · `maxlen:200`\n"
+    "**Time**\n"
+    "`newer:7d` / `older:30d` (s m h d w mo y) · `after:2025-01-01` · `before:2025-06-30`\n"
+    "**Other**\n"
+    "`pinned` (also delete pinned; kept by default) · `preview` (count only) · `scan:5000` (max messages read per channel)\n\n"
+    "**Examples**\n"
+    f"`{PREFIX}wipe @someone all` — every message they ever sent here\n"
+    f"`{PREFIX}wipe @someone 500 #general images links` — their latest 500 images/links in #general\n"
+    f"`{PREFIX}wipe 123456789012345678 all older:30d -#announcements` — works even after they left\n"
+    f"`{PREFIX}wipeme all contains:\"my number\" preview` — see how many of your messages mention it"
+)
+
+
+@bot.hybrid_command(name="wipe", aliases=["purgeuser", "scrub"])
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+@discord.app_commands.describe(
+    user="Whose messages to delete (mention or user ID — works for people who left)",
+    amount="How many of their newest matching messages, or 'all'",
+    filters="Optional: channels, types, words, dates. e.g. #general links newer:30d",
+)
+async def wipe_command(
+    ctx: commands.Context,
+    user: discord.User,
+    amount: str = "all",
+    *,
+    filters: str = "",
+) -> None:
+    await run_message_wipe(ctx, user, amount, filters, self_service=False)
+
+
+@bot.hybrid_command(name="wipeme")
+@commands.guild_only()
+@commands.cooldown(1, 600, commands.BucketType.member)
+@discord.app_commands.describe(
+    amount="How many of your newest matching messages, or 'all'",
+    filters="Optional: channels, types, words, dates. e.g. #general images older:1y",
+)
+async def wipeme_command(ctx: commands.Context, amount: str = "all", *, filters: str = "") -> None:
+    if ctx.guild is None:
+        return
+    if not get_guild_self_wipe_enabled(ctx.guild.id) and not (
+        isinstance(ctx.author, discord.Member) and is_moderator(ctx.author)
+    ):
+        ctx.command.reset_cooldown(ctx)
+        await ctx.send(
+            f"Self-service wipe is turned off in this server. Ask a moderator to run "
+            f"`{PREFIX}wipe` for you, or to enable it with `{PREFIX}selfwipe on`."
+        )
+        return
+    await run_message_wipe(ctx, ctx.author, amount, filters, self_service=True)
+
+
+@bot.hybrid_command(name="wipestop")
+@commands.guild_only()
+async def wipestop_command(ctx: commands.Context) -> None:
+    job = WIPE_JOBS.get(ctx.guild.id)
+    if job is None:
+        await ctx.send("No wipe is running in this server.")
+        return
+    allowed = ctx.author.id in {job.moderator_id} or (
+        isinstance(ctx.author, discord.Member) and is_moderator(ctx.author)
+    )
+    if not allowed:
+        await ctx.send("You can't stop this wipe.")
+        return
+    job.cancel_event.set()
+    await ctx.send("⏹️ Stopping the wipe after the current step.")
+
+
+@bot.hybrid_command(name="selfwipe")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+@discord.app_commands.describe(mode="on, off, or status")
+async def selfwipe_command(ctx: commands.Context, mode: str = "status") -> None:
+    mode = mode.strip().lower()
+    if mode in {"on", "enable", "true"}:
+        set_guild_self_wipe_enabled(ctx.guild.id, True)
+        await ctx.send(f"✅ Members can now wipe their own messages with `{PREFIX}wipeme`.")
+    elif mode in {"off", "disable", "false"}:
+        set_guild_self_wipe_enabled(ctx.guild.id, False)
+        await ctx.send(f"✅ Self-service wipe is off. Only moderators can use `{PREFIX}wipe`.")
+    else:
+        state = "on" if get_guild_self_wipe_enabled(ctx.guild.id) else "off"
+        await ctx.send(f"Self-service wipe is **{state}**. Use `{PREFIX}selfwipe on` or `off`.")
+
+
+@bot.hybrid_command(name="wipehelp")
+async def wipehelp_command(ctx: commands.Context) -> None:
+    await ctx.send(WIPE_HELP_TEXT)
 
 
 @bot.command(name="kick")
