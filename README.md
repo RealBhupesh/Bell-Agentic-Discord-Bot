@@ -85,6 +85,7 @@ Someone joins your server and starts reading through a member's old chats. That 
   - `&roast @user [soft|friendly|brutal]`
   - `&serverlore`
   - `&aicrush @user`
+  - `&crush [@user]` / `/crush`: who they flirt with most, opposite gender. No setup: Bell works out gender from how people chat. History is read once and saved, so repeat checks are instant.
   - `&analyze @user`
   - `&lie_detector @user <message>`
   - `&futureme`
@@ -164,7 +165,7 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `OPENROUTER_HTTP_REFERER=`
 - `AI_PROVIDER=openrouter`
 - `GROQ_API_KEY=`
-- `GROQ_MODEL=llama-3.1-8b-instant`
+- `GROQ_MODEL=openai/gpt-oss-20b`
 - `GROQ_API_URL=https://api.groq.com/openai/v1/chat/completions`
 - `GROQ_MODELS_URL=https://api.groq.com/openai/v1/models`
 - `AI_MAX_HISTORY=4`
@@ -252,7 +253,7 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `ROAST_HISTORY_PER_CHANNEL=280`
 - `ROAST_CACHE_MAX_MESSAGES=1400`
 - `OPENROUTER_FALLBACK_MODELS=google/gemma-3-4b-it:free,qwen/qwen3-4b:free,deepseek/deepseek-r1-0528:free`
-- `GROQ_FALLBACK_MODELS=llama-3.1-8b-instant,gemma2-9b-it`
+- `GROQ_FALLBACK_MODELS=openai/gpt-oss-20b,openai/gpt-oss-120b`
 - `FFMPEG_PATH=ffmpeg`
 - `MUSIC_MAX_PLAYLIST_ITEMS=50`
 - `SPOTIFY_CLIENT_ID=`

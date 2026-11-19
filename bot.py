@@ -23,6 +23,7 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+import flirt_crush
 import message_wipe
 
 try:
@@ -95,7 +96,7 @@ OPENROUTER_MODELS_URL = os.getenv("OPENROUTER_MODELS_URL", "https://openrouter.a
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Discord Mod Bot").strip()
 OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
 GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
 GROQ_MODELS_URL = os.getenv("GROQ_MODELS_URL", "https://api.groq.com/openai/v1/models").strip()
 AI_MAX_HISTORY = env_int("AI_MAX_HISTORY", 4, 2)
@@ -152,7 +153,7 @@ GROQ_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "GROQ_FALLBACK_MODELS",
-        "llama-3.1-8b-instant,gemma2-9b-it",
+        "openai/gpt-oss-20b,openai/gpt-oss-120b",
     ).split(",")
     if model.strip()
 ]
@@ -196,13 +197,13 @@ AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS = env_int(
 AICRUSH_STATE_STALE_SECONDS = env_int("AICRUSH_STATE_STALE_SECONDS", 1800, 60)
 AICRUSH_RANK_MODEL = os.getenv("AICRUSH_RANK_MODEL", "openai/gpt-oss-120b").strip()
 AICRUSH_EXPLAIN_MODEL = os.getenv(
-    "AICRUSH_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
+    "AICRUSH_EXPLAIN_MODEL", "openai/gpt-oss-120b"
 ).strip()
 AICRUSH_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "AICRUSH_FALLBACK_MODELS",
-        "llama-3.3-70b-versatile,openai/gpt-oss-20b",
+        "openai/gpt-oss-120b,openai/gpt-oss-20b",
     ).split(",")
     if model.strip()
 ]
@@ -230,7 +231,7 @@ ALTFINDER_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "ALTFINDER_FALLBACK_MODELS",
-        "moonshotai/kimi-k2-instruct-0905,llama-3.3-70b-versatile,openai/gpt-oss-20b",
+        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-120b,openai/gpt-oss-20b",
     ).split(",")
     if model.strip()
 ]
@@ -253,13 +254,13 @@ SOCIALINTEL_RANK_MODEL = os.getenv(
     "SOCIALINTEL_RANK_MODEL", "openai/gpt-oss-120b"
 ).strip()
 SOCIALINTEL_EXPLAIN_MODEL = os.getenv(
-    "SOCIALINTEL_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
+    "SOCIALINTEL_EXPLAIN_MODEL", "openai/gpt-oss-120b"
 ).strip()
 SOCIALINTEL_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "SOCIALINTEL_FALLBACK_MODELS",
-        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-20b,llama-3.3-70b-versatile",
+        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-20b,openai/gpt-oss-120b",
     ).split(",")
     if model.strip()
 ]
@@ -503,9 +504,7 @@ AI_MOD_HINGLISH_NORMALIZE_MAP: dict[str, str] = {
     "chutiya": "abuse",
     "chutya": "abuse",
     "madarchod": "abuse",
-    "mc": "abuse",
     "bhenchod": "abuse",
-    "bc": "abuse",
     "gandu": "abuse",
     "bakchod": "abusive",
     "bakchodi": "abusive",
@@ -1506,6 +1505,16 @@ def _ai_mod_normalize_hinglish(content: str) -> tuple[str, list[str]]:
     return " ".join(normalized), tags
 
 
+def _ai_mod_hint_hits(hints: set[str], *texts: str) -> int:
+    """Count hints that appear as whole words/phrases (so "upi" doesn't match "stupid")."""
+    hits = 0
+    for hint in hints:
+        pattern = r"(?<![a-z0-9])" + re.escape(hint) + r"(?![a-z0-9])"
+        if any(re.search(pattern, text) for text in texts):
+            hits += 1
+    return hits
+
+
 def _ai_mod_heuristic_payload(
     content: str,
     normalized_text: str,
@@ -1519,13 +1528,17 @@ def _ai_mod_heuristic_payload(
     score = 0.05
     suggested = "none"
 
-    scam_hits = sum(1 for hint in AI_MOD_SCAM_HINTS if hint in lowered or hint in normalized)
-    abuse_hits = sum(1 for hint in AI_MOD_ABUSE_HINTS if hint in lowered or hint in normalized)
-    spam_hits = sum(1 for hint in AI_MOD_SPAM_HINTS if hint in lowered or hint in normalized)
+    scam_hits = _ai_mod_hint_hits(AI_MOD_SCAM_HINTS, lowered, normalized)
+    abuse_hits = _ai_mod_hint_hits(AI_MOD_ABUSE_HINTS, lowered, normalized)
+    spam_hits = _ai_mod_hint_hits(AI_MOD_SPAM_HINTS, lowered, normalized)
     has_link = bool(LINK_PATTERN.search(content))
     has_many_mentions = len(re.findall(r"<@!?\d+>", content)) >= 4
-    repeated_chars = bool(re.search(r"(.)\1{6,}", content))
-    upper_ratio = (sum(1 for ch in content if ch.isupper()) / max(1, len(content))) if content else 0.0
+    repeated_chars = bool(re.search(r"(.)\1{11,}", content))
+    letters = [ch for ch in content if ch.isalpha()]
+    # Short shouts like "LOL" or "OMG" aren't spam; only judge caps on longer messages.
+    upper_ratio = (
+        sum(1 for ch in letters if ch.isupper()) / len(letters) if len(letters) >= 20 else 0.0
+    )
 
     if has_link and scam_hits >= 1:
         category = "scam_phishing"
@@ -3537,6 +3550,9 @@ async def flush_aicrush_state(force: bool = False) -> None:
             pass
 
 
+AICRUSH_FLIRT_INDEX_VERSION = 1
+
+
 def get_guild_aicrush_state(guild_id: int) -> dict[str, Any]:
     state = get_aicrush_state()
     guilds = state.setdefault("guilds", {})
@@ -3552,6 +3568,13 @@ def get_guild_aicrush_state(guild_id: int) -> dict[str, Any]:
     for field in ("channels", "users", "edges", "meta"):
         if not isinstance(guild_state.get(field), dict):
             guild_state[field] = {}
+    if guild_state["meta"].get("flirt_index_version") != AICRUSH_FLIRT_INDEX_VERSION:
+        # Older saved indexes have no flirt counts; start over once so history is re-read with them.
+        guild_state["channels"] = {}
+        guild_state["users"] = {}
+        guild_state["edges"] = {}
+        guild_state["meta"] = {"flirt_index_version": AICRUSH_FLIRT_INDEX_VERSION}
+        _mark_aicrush_dirty()
     meta = guild_state["meta"]
     meta.setdefault("messages_indexed", 0)
     meta.setdefault("last_backfill_ts", 0.0)
@@ -5414,6 +5437,44 @@ def _aicrush_update_edge(
     _aicrush_append_unique_sample(samples, sample_text, 6)
 
 
+def _aicrush_add_gender_votes(
+    guild_state: dict[str, Any], user_id: int, male: float, female: float
+) -> None:
+    if male <= 0 and female <= 0:
+        return
+    votes_by_user = guild_state.setdefault("meta", {}).setdefault("gender_votes", {})
+    row = votes_by_user.setdefault(str(user_id), {"male": 0.0, "female": 0.0})
+    row["male"] = round(float(row.get("male", 0.0) or 0.0) + male, 3)
+    row["female"] = round(float(row.get("female", 0.0) or 0.0) + female, 3)
+
+
+def guess_member_gender(guild_state: dict[str, Any], member: discord.Member) -> str | None:
+    """Gender from existing role names if any, otherwise from how they chat. No setup needed."""
+    from_roles = detect_member_gender_from_roles(member)
+    if from_roles is not None:
+        return from_roles
+    votes = guild_state.get("meta", {}).get("gender_votes", {})
+    if not isinstance(votes, dict):
+        return None
+    return flirt_crush.resolve_gender(votes.get(str(member.id)))
+
+
+def _aicrush_add_flirt(
+    guild_state: dict[str, Any],
+    source_id: int,
+    target_id: int,
+    *,
+    amount: float,
+    created_ts: float,
+) -> None:
+    if source_id == target_id or amount <= 0:
+        return
+    row = _aicrush_get_edge_row(guild_state, source_id, target_id)
+    row["flirt_score"] = round(float(row.get("flirt_score", 0.0) or 0.0) + amount, 4)
+    row["flirt_count"] = int(row.get("flirt_count", 0) or 0) + 1
+    row["flirt_last_ts"] = max(float(row.get("flirt_last_ts", 0.0) or 0.0), created_ts)
+
+
 def _aicrush_extract_name_hit_targets(
     guild: discord.Guild,
     author_id: int,
@@ -5477,6 +5538,8 @@ def _aicrush_invalidate_result_cache(guild_id: int, user_ids: set[int]) -> None:
     for cache_key in list(AICRUSH_RESULT_CACHE.keys()):
         if cache_key[0] == guild_id and cache_key[1] in user_ids:
             AICRUSH_RESULT_CACHE.pop(cache_key, None)
+    for user_id in user_ids:
+        FLIRT_CRUSH_CACHE.pop((guild_id, user_id), None)
 
 
 def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -> set[int]:
@@ -5520,6 +5583,7 @@ def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -
     meta["messages_indexed"] = int(meta.get("messages_indexed", 0) or 0) + 1
 
     _aicrush_update_user_profile(guild_state, member, content, created_ts)
+    _aicrush_add_gender_votes(guild_state, member.id, *flirt_crush.self_gender_votes(content))
     direct_target_ids = {
         int(mentioned.id)
         for mentioned in message.mentions
@@ -5527,6 +5591,13 @@ def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -
     }
     reply_target_id = _aicrush_resolve_reply_target_id(message)
     impacted_ids: set[int] = {member.id}
+    addressed_ids = set(direct_target_ids)
+    if reply_target_id is not None and reply_target_id != member.id:
+        addressed_ids.add(reply_target_id)
+    if addressed_ids:
+        male_vote, female_vote = flirt_crush.address_gender_votes(content)
+        for addressed_id in addressed_ids:
+            _aicrush_add_gender_votes(guild_state, addressed_id, male_vote, female_vote)
 
     _aicrush_remember_message_author(int(message.id), int(member.id), created_ts)
 
@@ -5576,12 +5647,37 @@ def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -
         impacted_ids.add(reply_target_id)
 
     normalized_content = normalize_aicrush_text(content)
-    for target_id, hit_score in _aicrush_extract_name_hit_targets(
+    name_hits = _aicrush_extract_name_hit_targets(
         message.guild,
         member.id,
         normalized_content,
         direct_target_ids=direct_target_ids,
-    ).items():
+    )
+
+    flirt_amount = flirt_crush.flirt_score(message.content or content)
+    if flirt_amount > 0:
+        flirt_targets: dict[int, float] = {}
+        if reply_target_id is not None and reply_target_id != member.id:
+            flirt_targets[reply_target_id] = 1.0
+        for target_id in direct_target_ids:
+            flirt_targets[target_id] = max(flirt_targets.get(target_id, 0.0), 1.0)
+        for target_id in name_hits:
+            flirt_targets[target_id] = max(flirt_targets.get(target_id, 0.0), 0.8)
+        if not flirt_targets and 1 <= len(recent_others) <= 2:
+            # No reply/mention: credit whoever they're chatting with right now.
+            for other_id in recent_others:
+                flirt_targets[other_id] = 0.5 / len(recent_others)
+        for target_id, weight in flirt_targets.items():
+            _aicrush_add_flirt(
+                guild_state,
+                member.id,
+                target_id,
+                amount=flirt_amount * weight,
+                created_ts=created_ts,
+            )
+            impacted_ids.add(target_id)
+
+    for target_id, hit_score in name_hits.items():
         _aicrush_update_edge(
             guild_state,
             member.id,
@@ -6263,19 +6359,27 @@ async def rerank_aicrush_candidates_with_ai(
     return picked_id, reason, confidence
 
 
+AICRUSH_AI_OVERRIDE_MIN_RATIO = 0.85
+
+
 def _aicrush_pick_row(
     candidates: list[dict[str, Any]],
     picked_id: int | None,
 ) -> dict[str, Any] | None:
+    """Pick the heuristic leader unless the AI chose someone whose evidence is nearly as strong."""
     if not candidates:
         return None
+    top = candidates[0]
     if picked_id is None:
-        return candidates[0]
+        return top
+    top_score = float(top.get("heuristic_score", 0.0))
     for row in candidates:
         member = row.get("member")
         if isinstance(member, discord.Member) and int(member.id) == picked_id:
-            return row
-    return candidates[0]
+            if float(row.get("heuristic_score", 0.0)) >= top_score * AICRUSH_AI_OVERRIDE_MIN_RATIO:
+                return row
+            return top
+    return top
 
 
 def _aicrush_direction_summary(label: str, row: dict[str, Any] | None) -> str:
@@ -17734,6 +17838,7 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}psych [start|stop|reset|status] [message]` - Listen-first psych mode (replies after pause, asks before advice).\n"
         f"`{PREFIX}roast <@user> [soft|friendly|brutal]` - Personal roast from server-wide chat patterns.\n"
         f"`{PREFIX}serverlore`, `{PREFIX}aicrush <@user>`, `{PREFIX}analyze <@user>`\n"
+        f"`{PREFIX}crush [@user]` (or `/crush`) - Who they flirt with most (opposite gender), saved and instant on repeat.\n"
         f"`{PREFIX}lie_detector <@user> <message>`, `{PREFIX}futureme`\n"
         f"`{PREFIX}rizzcoach [smooth|funny|mysterious] <message>`\n"
         f"`{PREFIX}argument <topic>` - starts persistent argument mode (`bell stop argument` to end).\n"
@@ -21570,6 +21675,125 @@ async def arcreport_command(
     await send_chunked(ctx, result)
 
 
+FLIRT_CRUSH_CACHE: dict[tuple[int, int], dict[str, Any]] = {}
+FLIRT_CRUSH_SCAN_LOCKS: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def _flirt_crush_coverage(guild: discord.Guild) -> tuple[int, int]:
+    guild_state = get_guild_aicrush_state(guild.id)
+    channel_rows = guild_state.get("channels", {})
+    readable = get_readable_text_channels(guild)
+    if AICRUSH_MAX_CHANNELS > 0:
+        readable = readable[:AICRUSH_MAX_CHANNELS]
+    done = sum(
+        1
+        for channel in readable
+        if isinstance(channel_rows.get(str(channel.id)), dict)
+        and bool(channel_rows[str(channel.id)].get("fully_scanned"))
+    )
+    return done, len(readable)
+
+
+def build_flirt_crush_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    guild_state = get_guild_aicrush_state(guild.id)
+    target_gender = guess_member_gender(guild_state, member)
+
+    def eligible(uid: int) -> bool:
+        other = guild.get_member(uid)
+        return other is not None and not other.bot
+
+    def gender_of(uid: int) -> str | None:
+        other = guild.get_member(uid)
+        return guess_member_gender(guild_state, other) if other is not None else None
+
+    candidates, stats = flirt_crush.rank_crush_candidates(
+        member.id,
+        target_gender,
+        guild_state.get("edges", {}),
+        gender_of,
+        is_eligible=eligible,
+        limit=3,
+    )
+    done, total = _flirt_crush_coverage(guild)
+    indexed = int(guild_state.get("meta", {}).get("messages_indexed", 0) or 0)
+
+    embed = discord.Embed(title=f"💘 {member.display_name}'s crush", color=discord.Color.from_rgb(255, 92, 141))
+    top = candidates[0] if candidates else None
+    if top is None or top.flirt_sent_score <= 0:
+        lines = [f"I haven't seen {member.mention} flirt with anyone yet."]
+        if top is not None:
+            lines.append(f"But <@{top.user_id}> has been flirting with **them** 👀")
+        embed.description = "\n".join(lines)
+    else:
+        confidence = flirt_crush.crush_confidence(candidates)
+        embed.description = f"## <@{top.user_id}>\nConfidence: **{confidence}%**" + (
+            "\n💞 **It's mutual** — they flirt back!" if top.mutual else ""
+        )
+        embed.add_field(
+            name="Flirty messages",
+            value=(
+                f"{member.display_name} → them: **{top.flirts_sent}**\n"
+                f"them → {member.display_name}: **{top.flirts_received}**"
+            ),
+            inline=False,
+        )
+        runners = [c for c in candidates[1:] if c.flirt_sent_score > 0]
+        if runners:
+            embed.add_field(
+                name="Also flirting with",
+                value="\n".join(
+                    f"<@{c.user_id}> — {c.flirts_sent} sent / {c.flirts_received} back" for c in runners
+                ),
+                inline=False,
+            )
+    if done < total:
+        embed.add_field(
+            name="Still reading",
+            value=f"Older chats are still being read ({done}/{total} channels). Run it again in a bit for a sharper answer.",
+            inline=False,
+        )
+    embed.set_footer(text=f"Based on {indexed:,} saved messages · For fun only")
+    return embed
+
+
+@bot.hybrid_command(name="crush", aliases=["flirtcrush"])
+@commands.cooldown(3, 30, commands.BucketType.user)
+@commands.guild_only()
+@discord.app_commands.describe(member="Whose crush to find (leave empty for yourself)")
+async def crush_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    guild = ctx.guild
+    member = member or ctx.author
+    if not isinstance(member, discord.Member) or member.bot:
+        await ctx.send("This command is for server members only.")
+        return
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+
+    cache_key = (guild.id, member.id)
+    done, total = _flirt_crush_coverage(guild)
+    history_complete = total > 0 and done >= total
+    cached = FLIRT_CRUSH_CACHE.get(cache_key)
+    if cached is not None and history_complete:
+        await ctx.send(embed=discord.Embed.from_dict(cached))
+        return
+
+    async with ctx.typing():
+        if not history_complete:
+            lock = FLIRT_CRUSH_SCAN_LOCKS[guild.id]
+            async with lock:
+                await run_aicrush_backfill(
+                    guild,
+                    message_budget=AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES,
+                    time_budget_seconds=AICRUSH_COMMAND_MAX_BACKFILL_SECONDS,
+                )
+        embed = build_flirt_crush_embed(guild, member)
+
+    done, total = _flirt_crush_coverage(guild)
+    if total > 0 and done >= total:
+        FLIRT_CRUSH_CACHE[cache_key] = embed.to_dict()
+    await ctx.send(embed=embed)
+
+
 @bot.hybrid_command(name="aicrush")
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
@@ -21675,25 +21899,9 @@ async def aicrush_command(ctx: commands.Context, member: discord.Member) -> None
             admirer_member = admirer_row.get("member") if isinstance(admirer_row, dict) else None
 
             if isinstance(crush_member, discord.Member):
-                history_key = (ctx.guild.id, member.id)
-                previous = AICRUSH_LAST_MATCHES.get(history_key)
-                cooldown_seconds = AICRUSH_MATCH_COOLDOWN_HOURS * 3600
-                if (
-                    previous is not None
-                    and time.monotonic() - previous[1] < cooldown_seconds
-                    and previous[0] == crush_member.id
-                    and len(crush_pool) > 1
-                ):
-                    alt = crush_pool[1]
-                    alt_member = alt.get("member")
-                    if (
-                        isinstance(alt_member, discord.Member)
-                        and float(alt.get("heuristic_score", 0.0))
-                        >= float(crush_row.get("heuristic_score", 0.0)) * 0.72
-                    ):
-                        crush_row = alt
-                        crush_member = alt_member
-                AICRUSH_LAST_MATCHES[history_key] = (crush_member.id, time.monotonic())
+                # Same evidence should give the same answer every time, so the top
+                # match is never swapped out just because it was shown before.
+                AICRUSH_LAST_MATCHES[(ctx.guild.id, member.id)] = (crush_member.id, time.monotonic())
 
             explanation = await build_aicrush_pair_explanation(
                 member,
