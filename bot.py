@@ -503,9 +503,7 @@ AI_MOD_HINGLISH_NORMALIZE_MAP: dict[str, str] = {
     "chutiya": "abuse",
     "chutya": "abuse",
     "madarchod": "abuse",
-    "mc": "abuse",
     "bhenchod": "abuse",
-    "bc": "abuse",
     "gandu": "abuse",
     "bakchod": "abusive",
     "bakchodi": "abusive",
@@ -1506,6 +1504,16 @@ def _ai_mod_normalize_hinglish(content: str) -> tuple[str, list[str]]:
     return " ".join(normalized), tags
 
 
+def _ai_mod_hint_hits(hints: set[str], *texts: str) -> int:
+    """Count hints that appear as whole words/phrases (so "upi" doesn't match "stupid")."""
+    hits = 0
+    for hint in hints:
+        pattern = r"(?<![a-z0-9])" + re.escape(hint) + r"(?![a-z0-9])"
+        if any(re.search(pattern, text) for text in texts):
+            hits += 1
+    return hits
+
+
 def _ai_mod_heuristic_payload(
     content: str,
     normalized_text: str,
@@ -1519,13 +1527,17 @@ def _ai_mod_heuristic_payload(
     score = 0.05
     suggested = "none"
 
-    scam_hits = sum(1 for hint in AI_MOD_SCAM_HINTS if hint in lowered or hint in normalized)
-    abuse_hits = sum(1 for hint in AI_MOD_ABUSE_HINTS if hint in lowered or hint in normalized)
-    spam_hits = sum(1 for hint in AI_MOD_SPAM_HINTS if hint in lowered or hint in normalized)
+    scam_hits = _ai_mod_hint_hits(AI_MOD_SCAM_HINTS, lowered, normalized)
+    abuse_hits = _ai_mod_hint_hits(AI_MOD_ABUSE_HINTS, lowered, normalized)
+    spam_hits = _ai_mod_hint_hits(AI_MOD_SPAM_HINTS, lowered, normalized)
     has_link = bool(LINK_PATTERN.search(content))
     has_many_mentions = len(re.findall(r"<@!?\d+>", content)) >= 4
-    repeated_chars = bool(re.search(r"(.)\1{6,}", content))
-    upper_ratio = (sum(1 for ch in content if ch.isupper()) / max(1, len(content))) if content else 0.0
+    repeated_chars = bool(re.search(r"(.)\1{11,}", content))
+    letters = [ch for ch in content if ch.isalpha()]
+    # Short shouts like "LOL" or "OMG" aren't spam; only judge caps on longer messages.
+    upper_ratio = (
+        sum(1 for ch in letters if ch.isupper()) / len(letters) if len(letters) >= 20 else 0.0
+    )
 
     if has_link and scam_hits >= 1:
         category = "scam_phishing"
@@ -6263,19 +6275,27 @@ async def rerank_aicrush_candidates_with_ai(
     return picked_id, reason, confidence
 
 
+AICRUSH_AI_OVERRIDE_MIN_RATIO = 0.85
+
+
 def _aicrush_pick_row(
     candidates: list[dict[str, Any]],
     picked_id: int | None,
 ) -> dict[str, Any] | None:
+    """Pick the heuristic leader unless the AI chose someone whose evidence is nearly as strong."""
     if not candidates:
         return None
+    top = candidates[0]
     if picked_id is None:
-        return candidates[0]
+        return top
+    top_score = float(top.get("heuristic_score", 0.0))
     for row in candidates:
         member = row.get("member")
         if isinstance(member, discord.Member) and int(member.id) == picked_id:
-            return row
-    return candidates[0]
+            if float(row.get("heuristic_score", 0.0)) >= top_score * AICRUSH_AI_OVERRIDE_MIN_RATIO:
+                return row
+            return top
+    return top
 
 
 def _aicrush_direction_summary(label: str, row: dict[str, Any] | None) -> str:
@@ -21675,25 +21695,9 @@ async def aicrush_command(ctx: commands.Context, member: discord.Member) -> None
             admirer_member = admirer_row.get("member") if isinstance(admirer_row, dict) else None
 
             if isinstance(crush_member, discord.Member):
-                history_key = (ctx.guild.id, member.id)
-                previous = AICRUSH_LAST_MATCHES.get(history_key)
-                cooldown_seconds = AICRUSH_MATCH_COOLDOWN_HOURS * 3600
-                if (
-                    previous is not None
-                    and time.monotonic() - previous[1] < cooldown_seconds
-                    and previous[0] == crush_member.id
-                    and len(crush_pool) > 1
-                ):
-                    alt = crush_pool[1]
-                    alt_member = alt.get("member")
-                    if (
-                        isinstance(alt_member, discord.Member)
-                        and float(alt.get("heuristic_score", 0.0))
-                        >= float(crush_row.get("heuristic_score", 0.0)) * 0.72
-                    ):
-                        crush_row = alt
-                        crush_member = alt_member
-                AICRUSH_LAST_MATCHES[history_key] = (crush_member.id, time.monotonic())
+                # Same evidence should give the same answer every time, so the top
+                # match is never swapped out just because it was shown before.
+                AICRUSH_LAST_MATCHES[(ctx.guild.id, member.id)] = (crush_member.id, time.monotonic())
 
             explanation = await build_aicrush_pair_explanation(
                 member,
