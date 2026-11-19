@@ -95,7 +95,7 @@ OPENROUTER_MODELS_URL = os.getenv("OPENROUTER_MODELS_URL", "https://openrouter.a
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Discord Mod Bot").strip()
 OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
 GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
 GROQ_MODELS_URL = os.getenv("GROQ_MODELS_URL", "https://api.groq.com/openai/v1/models").strip()
 AI_MAX_HISTORY = env_int("AI_MAX_HISTORY", 4, 2)
@@ -152,7 +152,7 @@ GROQ_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "GROQ_FALLBACK_MODELS",
-        "llama-3.1-8b-instant,gemma2-9b-it",
+        "openai/gpt-oss-20b,openai/gpt-oss-120b",
     ).split(",")
     if model.strip()
 ]
@@ -196,13 +196,13 @@ AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS = env_int(
 AICRUSH_STATE_STALE_SECONDS = env_int("AICRUSH_STATE_STALE_SECONDS", 1800, 60)
 AICRUSH_RANK_MODEL = os.getenv("AICRUSH_RANK_MODEL", "openai/gpt-oss-120b").strip()
 AICRUSH_EXPLAIN_MODEL = os.getenv(
-    "AICRUSH_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
+    "AICRUSH_EXPLAIN_MODEL", "openai/gpt-oss-120b"
 ).strip()
 AICRUSH_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "AICRUSH_FALLBACK_MODELS",
-        "llama-3.3-70b-versatile,openai/gpt-oss-20b",
+        "openai/gpt-oss-120b,openai/gpt-oss-20b",
     ).split(",")
     if model.strip()
 ]
@@ -230,7 +230,7 @@ ALTFINDER_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "ALTFINDER_FALLBACK_MODELS",
-        "moonshotai/kimi-k2-instruct-0905,llama-3.3-70b-versatile,openai/gpt-oss-20b",
+        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-120b,openai/gpt-oss-20b",
     ).split(",")
     if model.strip()
 ]
@@ -253,13 +253,13 @@ SOCIALINTEL_RANK_MODEL = os.getenv(
     "SOCIALINTEL_RANK_MODEL", "openai/gpt-oss-120b"
 ).strip()
 SOCIALINTEL_EXPLAIN_MODEL = os.getenv(
-    "SOCIALINTEL_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
+    "SOCIALINTEL_EXPLAIN_MODEL", "openai/gpt-oss-120b"
 ).strip()
 SOCIALINTEL_FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
         "SOCIALINTEL_FALLBACK_MODELS",
-        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-20b,llama-3.3-70b-versatile",
+        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-20b,openai/gpt-oss-120b",
     ).split(",")
     if model.strip()
 ]
