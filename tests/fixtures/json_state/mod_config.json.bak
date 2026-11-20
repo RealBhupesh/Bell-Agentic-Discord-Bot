@@ -1,0 +1,18 @@
+{
+  "111111111111111111": {
+    "mod_log_channel_id": 222222222222222222,
+    "automod": {
+      "links": true,
+      "spam": true
+    },
+    "agentic": {
+      "enabled": true,
+      "nudges": {
+        "enabled": false
+      }
+    }
+  },
+  "333333333333333333": {
+    "mod_log_channel_id": null
+  }
+}
