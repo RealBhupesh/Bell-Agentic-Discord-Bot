@@ -1,0 +1,1 @@
+{"circuit":{"daily":false,"open_until":0.0},"features":{"agent":{"day":"2026-11-05","used":4}},"models":{"openai/gpt-oss-120b":{"blocked_until":0.0,"rpd":{"tokens":990.0,"updated":1793000000.0},"rpm":{"tokens":29.0,"updated":1793000000.0},"tpd":{"tokens":190000.0,"updated":1793000000.0},"tpm":{"tokens":7000.0,"updated":1793000000.0}}},"saved_at":1793000000.0,"version":1}
