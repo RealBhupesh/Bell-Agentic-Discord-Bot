@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "generated_at": 1793000000.0,
+  "commands": [
+    {
+      "name": "warn",
+      "domain": "moderation"
+    }
+  ],
+  "system_capabilities": []
+}
