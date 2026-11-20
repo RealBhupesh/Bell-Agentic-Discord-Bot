@@ -220,4 +220,4 @@ def test_no_state_file_without_path(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
     assert GroqBudgetGovernor.from_env({"GROQ_BUDGET_STATE_FILE": str(tmp_path / "s.json")}).state_path == (
         tmp_path / "s.json"
-                                  )
+    )
